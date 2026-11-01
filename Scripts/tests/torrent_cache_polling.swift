@@ -59,6 +59,9 @@ private enum FixtureError: Error { case unavailable }
     var duration = 100.0
     var volume: Float = 0.5
     var isMuted = false
+    struct Window { var openGeneration: Int64 = 1; var seekGeneration: Int64 = 1 }
+    var sourcePlaybackWindow = Window()
+    var seekSettled = true
     func cachedTimeline(forByteRanges bytes: [[NSNumber]]) -> [String: Any] {
         // Explicit fixture anchors; deliberately unrelated to byte/file ratios.
         let ranges = bytes.first?.first?.intValue == 1000 ? [[10.0,20.0]] : [[40.0,50.0]]
@@ -85,6 +88,15 @@ private enum FixtureError: Error { case unavailable }
     var torrentStatusTask: Task<Void, Never>?
     var torrentLastStatus: Status?
     var torrentLastCacheSnapshot: SPTorrentCacheSnapshot?
+    // INSERT_REFILL_OBSERVATION
+    var torrentPlaybackWindowEpoch = UUID()
+    var refillID: UUID? { torrentCacheRefillObservation?.id }
+    var refillLease: UUID? { torrentCacheRefillObservation?.leaseID }
+    var refillFile: Int? { torrentCacheRefillObservation?.cache.fileID }
+    var refillOpen: Int64? { torrentCacheRefillObservation?.openGeneration }
+    var refillSeek: Int64? { torrentCacheRefillObservation?.seekGeneration }
+    var refillPolicy: UUID? { torrentCacheRefillObservation?.policyEpoch }
+    var refillRequestedAt: TimeInterval? { torrentCacheRefillObservation?.requestedAt }
     var torrentTimelinePresentation: SPTorrentTimelinePresentation?
     var core: Core? = Core()
     var hasMediaSession = true
@@ -147,11 +159,17 @@ private enum FixtureError: Error { case unavailable }
         try await wait { vc.torrentLastCacheSnapshot?.fileID == 8 }
         check(vc.chrome!.ranges == [0.4...0.5] && vc.floatingVideo.ranges == [0.4...0.5],
               "The current episode publishes its exact mapped coverage to both timelines")
+        check(vc.refillID != nil && vc.refillLease == lease && vc.refillFile == 8 &&
+              vc.refillOpen == 1 && vc.refillSeek == 1 && vc.refillPolicy == vc.torrentPlaybackWindowEpoch,
+              "A fresh cache reply records its exact lease, file, source generations and policy epoch")
+        let firstObservation = vc.refillID
         let currentUpdates = vc.chrome!.updates
         server.cacheReply(1)
         await settle()
         check(vc.chrome!.updates == currentUpdates && vc.chrome!.ranges == [0.4...0.5],
               "A cancelled old cache reply cannot repaint a different episode sharing the same lease")
+        check(vc.refillID == firstObservation,
+              "A cancelled old cache reply cannot replace the current repair observation")
         vc.floatingVideo.ranges = []
         vc.enterPiP()
         check(vc.floatingVideo.playbackUpdates == 1 && vc.floatingVideo.ranges == [0.4...0.5],
@@ -165,6 +183,7 @@ private enum FixtureError: Error { case unavailable }
         try await wait { vc.torrentLastCacheSnapshot == nil }
         check(vc.chrome!.ranges.isEmpty && vc.floatingVideo.ranges.isEmpty && vc.chrome!.visible,
               "A current cache-poll failure removes stale resident markings instead of retaining old bars")
+        check(vc.refillID == nil, "A current cache-poll failure revokes the resident repair observation")
         check(vc.pauseUpdates == pauses && vc.torrentContext?.file.id == 8,
               "Diagnostic cache-poll failure does not restart or stop the playback/prefetch owner")
         try await wait { server.statuses[4] != nil }
@@ -220,6 +239,62 @@ private enum FixtureError: Error { case unavailable }
         check(!vc.chrome!.visible && !vc.floatingVideo.visible && vc.torrentLastCacheSnapshot == nil,
               "Close/local-source reset stays clear after an outstanding status request completes")
         check(server.cacheCount == 6, "A closed source cannot start another cache request from its late status reply")
+        check(vc.refillID == nil, "Close revokes any resident repair authorization")
+        server.finish()
+        await settle()
+
+        // Exercise the actual suspension between cache request and response.
+        // A physical cache map can remain useful to the timeline, but it cannot
+        // authorize repair in an epoch that did not issue that observation.
+        func beginCache(_ owner: Controller, _ context: SPTorrentPlaybackContext) async throws -> Int {
+            let statusID = server.statusCount + 1
+            let cacheID = server.cacheCount + 1
+            owner.start(context)
+            try await wait { server.statuses[statusID] != nil }
+            server.statusReply(statusID)
+            try await wait { server.caches[cacheID] != nil }
+            return cacheID
+        }
+        for change in ["seek", "open", "policy", "unsettled", "invalidSource"] {
+            let owner = Controller()
+            let cacheID = try await beginCache(owner, a)
+            switch change {
+            case "seek": owner.core!.sourcePlaybackWindow.seekGeneration += 1
+            case "open": owner.core!.sourcePlaybackWindow.openGeneration += 1
+            case "policy": owner.torrentPlaybackWindowEpoch = UUID()
+            case "unsettled": owner.core!.seekSettled = false
+            default: owner.core!.sourcePlaybackWindow.openGeneration = -1
+            }
+            server.cacheReply(cacheID)
+            try await wait { owner.torrentLastCacheSnapshot != nil }
+            check(owner.refillID == nil,
+                  "A cache response crossing \(change) cannot authorize resident-gap repair")
+            owner.close()
+        }
+        let owner = Controller()
+        let firstCache = try await beginCache(owner, a)
+        server.cacheReply(firstCache)
+        try await wait { owner.refillID != nil }
+        let firstID = owner.refillID
+        check(owner.refillRequestedAt.map { $0 <= ProcessInfo.processInfo.systemUptime &&
+              ProcessInfo.processInfo.systemUptime - $0 < 3 } == true,
+              "Fresh observations retain the actual pre-request monotonic time")
+        let secondStatus = server.statusCount + 1
+        let secondCache = server.cacheCount + 1
+        try await wait { server.statuses[secondStatus] != nil }
+        server.statusReply(secondStatus)
+        try await wait { server.caches[secondCache] != nil }
+        server.cacheReply(secondCache)
+        try await wait { owner.refillID != nil && owner.refillID != firstID }
+        check(owner.refillID != firstID && owner.refillFile == 7,
+              "A new accepted observation gets a distinct token even when resident ranges are unchanged")
+        let failingStatus = server.statusCount + 1
+        try await wait { server.statuses[failingStatus] != nil }
+        server.statusReply(failingStatus, failing: true)
+        try await wait { owner.torrentLastCacheSnapshot == nil }
+        check(owner.refillID == nil,
+              "A current status failure revokes the previously accepted repair observation")
+        owner.close()
         server.finish()
         await settle()
         print("Torrent cache polling checks passed (\(count) assertions; controlled async replies, actual owner methods).")

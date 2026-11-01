@@ -11,14 +11,13 @@ private struct SPTorrentPrefetchCapacityStop: Equatable {
 
 private struct Context {
     struct Descriptor { let hash = "owned-fixture"; let leaseID = UUID() }
-    struct MediaFile { let id = 7; let length: Int64 = 1_048_576 }
     let descriptor = Descriptor()
-    let file = MediaFile()
+    let file = SPTorrentFile(id: 7, path: "owned-fixture.mp4", length: 1_048_576)
     let streamURL = URL(string: "http://127.0.0.1/owned-fixture")!
 }
 @MainActor private final class Core {
     enum State { case opening, ready, playing, paused, idle, ended, failed }
-    struct Window { var openGeneration: Int64 = 1; var seekGeneration: Int64 = 1 }
+    struct Window { var openGeneration: Int64 = 1; var seekGeneration: Int64 = 1; var playbackOffset: Int64 = 256 }
     var state = State.playing
     var seekSettled = true
     var sourceReadOffset: Int64 = 256
@@ -26,6 +25,7 @@ private struct Context {
 }
 @MainActor private final class SPTorrentPauseBuffer {
     struct Identity { let hash: String; let fileID: Int; let sessionGeneration: UUID }
+    struct ResidentGap: Equatable { let observationID: UUID; let start: Int64; let end: Int64 }
     enum State { case idle, filling, filled, waitingForCapacity, stopped, failed }
     struct Snapshot { var state = State.idle }
     var snapshot = Snapshot()
@@ -33,10 +33,27 @@ private struct Context {
     var cancellations = 0
     var lastCapacityStop: SPTorrentPrefetchCapacityStop?
     var lastOffset: Int64?
+    var lastForwardUpper: Int64?
+    var repairCalls = 0
+    var handlesRepair = false
+    var lastGap: ResidentGap?
+    var lastApprovedLower: Int64?
+    var lastApprovedUpper: Int64?
+    var lastConfirmedResidentCoverage = false
+    func repairResidentGap(identity: Identity, streamURL: URL, fileLength: Int64,
+                           approvedLowerBound: Int64, approvedUpperBound: Int64,
+                           gap: ResidentGap?, capacityStop: SPTorrentPrefetchCapacityStop? = nil,
+                           confirmedResidentCoverage: Bool = false) -> Bool {
+        repairCalls += 1
+        lastConfirmedResidentCoverage = confirmedResidentCoverage
+        lastGap = gap; lastCapacityStop = capacityStop
+        lastApprovedLower = approvedLowerBound; lastApprovedUpper = approvedUpperBound
+        return handlesRepair
+    }
     func start(identity: Identity, streamURL: URL, offset: Int64, fileLength: Int64, forwardEndOffset: Int64,
                capacityStop: SPTorrentPrefetchCapacityStop? = nil) {
         lastCapacityStop = capacityStop
-        lastOffset = offset
+        lastOffset = offset; lastForwardUpper = forwardEndOffset
         starts += 1; snapshot.state = .filling
     }
     func cancel() { cancellations += 1; snapshot.state = .idle }
@@ -49,9 +66,12 @@ private struct Context {
         var openGeneration: Int64 = 1
         var seekGeneration: Int64 = 1
         var historyLowerBound: Int64 = 0
-        let forwardUpperBound: Int64 = 65536
+        var forwardUpperBound: Int64 = 65536
         var prefetchCapacityStop: SPTorrentPrefetchCapacityStop?
     }
+    // INSERT_PRODUCTION_OBSERVATION
+    private var torrentCacheRefillObservation: TorrentCacheRefillObservation?
+    var torrentPlaybackWindowEpoch = UUID()
     var torrentContext: Context? = Context()
     var core: Core? = Core()
     var hasMediaSession = true
@@ -66,6 +86,26 @@ private struct Context {
         torrentAppliedPlaybackWindow = AppliedWindow(leaseID: torrentContext!.descriptor.leaseID,
                                                      fileID: torrentContext!.file.id)
     }
+    func observe(_ ranges: [[Int64]], lease: UUID? = nil, open: Int64? = nil, seek: Int64? = nil,
+                 policy: UUID? = nil, requestedAt: TimeInterval? = nil, fileID: Int? = nil,
+                 fileLength: Int64? = nil) -> UUID {
+        let context = torrentContext!
+        let observedFile = SPTorrentFile(id: fileID ?? context.file.id, path: context.file.path,
+                                        length: fileLength ?? context.file.length)
+        let cache = SPTorrentCacheSnapshot(json: ["hash": context.descriptor.hash,
+            "file_index": observedFile.id, "file_offset": 0, "file_length": observedFile.length,
+            "piece_length": 1, "resident_bytes": ranges.reduce(Int64(0)) { $0 + $1[1] - $1[0] },
+            "ranges": ranges], expectedHash: context.descriptor.hash, file: observedFile)!
+        let id = UUID()
+        torrentCacheRefillObservation = .init(id: id, cache: cache,
+            leaseID: lease ?? context.descriptor.leaseID,
+            openGeneration: open ?? core!.sourcePlaybackWindow.openGeneration,
+            seekGeneration: seek ?? core!.sourcePlaybackWindow.seekGeneration,
+            policyEpoch: policy ?? torrentPlaybackWindowEpoch,
+            requestedAt: requestedAt ?? ProcessInfo.processInfo.systemUptime)
+        return id
+    }
+    func forgetObservation() { torrentCacheRefillObservation = nil }
     func refreshPlaylistView() {}
     func updateTorrentBackgroundJobs() {}
     func startTorrentPlaybackWindowPolicyIfNeeded() {}
@@ -185,6 +225,106 @@ private struct Context {
               "Opening a replacement source stops the old reader and monitor")
         vc.close()
         check(!vc.torrentPauseBufferManuallyStopped, "Source close resets the per-source manual Stop preference")
+        // Exercise the exact production owner against actual resident-range
+        // parsing/planning. Only the manager's admission boundary is recorded;
+        // its real HTTP behavior is covered separately by pause-buffer checks.
+        let gapOwner = Controller()
+        defer { gapOwner.close() }
+        gapOwner.core!.sourcePlaybackWindow.playbackOffset = 1_000
+        gapOwner.core!.sourceReadOffset = 12_000
+        gapOwner.torrentPauseBuffer.snapshot.state = .waitingForCapacity
+        gapOwner.torrentPauseBuffer.handlesRepair = true
+        let observation = gapOwner.observe([[0, 2_000], [4_000, 60_000]])
+        gapOwner.update()
+        check(gapOwner.torrentPauseBuffer.lastGap == .init(observationID: observation, start: 2_000, end: 4_000),
+              "The owner repairs the earliest actual resident hole before a distant decoder cursor")
+        check(gapOwner.torrentPauseBuffer.starts == 0 && gapOwner.torrentPauseBuffer.lastApprovedLower == 1_000 &&
+              gapOwner.torrentPauseBuffer.lastApprovedUpper == 65_536 && !gapOwner.torrentPauseBuffer.lastConfirmedResidentCoverage,
+              "A bounded repair owns the monitor and remains inside the accepted playback window")
+        gapOwner.core!.state = .paused
+        gapOwner.update()
+        check(gapOwner.torrentPauseBuffer.lastGap?.observationID == observation && gapOwner.torrentPauseBuffer.starts == 0,
+              "Pausing retains the same observation identity instead of inventing another refill")
+        gapOwner.forgetObservation()
+        gapOwner.update()
+        check(gapOwner.torrentPauseBuffer.lastGap == nil && gapOwner.torrentPauseBuffer.starts == 0 &&
+              !gapOwner.torrentPauseBuffer.lastConfirmedResidentCoverage,
+              "An unknown cache map preserves an admitted repair without confirming residency")
+        gapOwner.torrentPauseBuffer.handlesRepair = false
+        gapOwner.update()
+        check(gapOwner.torrentPauseBuffer.starts == 1,
+              "Unknown residency without an active repair retains the normal forward reader")
+        _ = gapOwner.observe([[1_000, 65_536]])
+        for terminal in [SPTorrentPauseBuffer.State.filled, .waitingForCapacity] {
+            gapOwner.torrentPauseBuffer.snapshot.state = terminal
+            let beforeFull = gapOwner.torrentPauseBuffer.starts
+            gapOwner.update()
+            check(gapOwner.torrentPauseBuffer.lastGap == nil && gapOwner.torrentPauseBuffer.starts == beforeFull &&
+                  gapOwner.torrentPauseBuffer.lastConfirmedResidentCoverage,
+                  "A fresh fully resident terminal window confirms coverage and suppresses whole-window fill: \(terminal)")
+        }
+        gapOwner.torrentPauseBuffer.snapshot.state = .filling
+        gapOwner.torrentAppliedPlaybackWindow!.forwardUpperBound = 5_000
+        gapOwner.torrentAppliedPlaybackWindow!.prefetchCapacityStop = proof
+        let beforeActiveQuota = gapOwner.torrentPauseBuffer.starts
+        gapOwner.update()
+        check(gapOwner.torrentPauseBuffer.starts == beforeActiveQuota + 1 &&
+              gapOwner.torrentPauseBuffer.lastForwardUpper == 5_000 && gapOwner.torrentPauseBuffer.lastCapacityStop == proof &&
+              gapOwner.torrentPauseBuffer.lastConfirmedResidentCoverage,
+              "A fully resident map still forwards shrunk quota and exact capacity proof to an ordinary active read")
+        for initial in [SPTorrentPauseBuffer.State.idle, .stopped] {
+            gapOwner.torrentPauseBuffer.snapshot.state = initial
+            let beforeInitial = gapOwner.torrentPauseBuffer.starts
+            gapOwner.update()
+            check(gapOwner.torrentPauseBuffer.starts == beforeInitial + 1,
+                  "Fully resident observations cannot suppress ordinary idle/start or explicit Resume: \(initial)")
+        }
+        gapOwner.torrentAppliedPlaybackWindow!.forwardUpperBound = 65_536
+        gapOwner.torrentPauseBuffer.handlesRepair = true
+        gapOwner.forgetObservation()
+        gapOwner.update()
+        check(!gapOwner.torrentPauseBuffer.lastConfirmedResidentCoverage,
+              "A missing observation revokes the previous confirmation instead of resetting backoff")
+        gapOwner.torrentPauseBuffer.handlesRepair = false
+        for invalid in ["lease", "open", "seek", "policy", "age", "file", "length"] {
+            gapOwner.forgetObservation()
+            _ = gapOwner.observe([[1_000, 2_000], [4_000, 60_000]],
+                lease: invalid == "lease" ? UUID() : nil,
+                open: invalid == "open" ? 2 : nil, seek: invalid == "seek" ? 2 : nil,
+                policy: invalid == "policy" ? UUID() : nil,
+                requestedAt: invalid == "age" ? ProcessInfo.processInfo.systemUptime - 6 : nil,
+                fileID: invalid == "file" ? 8 : nil, fileLength: invalid == "length" ? 2_000_000 : nil)
+            gapOwner.update()
+            check(gapOwner.torrentPauseBuffer.lastGap == nil && !gapOwner.torrentPauseBuffer.lastConfirmedResidentCoverage,
+                  "A stale or mismatched resident map cannot authorize repair: \(invalid)")
+            _ = gapOwner.observe([[1_000, 65_536]],
+                lease: invalid == "lease" ? UUID() : nil,
+                open: invalid == "open" ? 2 : nil, seek: invalid == "seek" ? 2 : nil,
+                policy: invalid == "policy" ? UUID() : nil,
+                requestedAt: invalid == "age" ? ProcessInfo.processInfo.systemUptime - 6 : nil,
+                fileID: invalid == "file" ? 8 : nil, fileLength: invalid == "length" ? 2_000_000 : nil)
+            gapOwner.update()
+            check(!gapOwner.torrentPauseBuffer.lastConfirmedResidentCoverage,
+                  "A stale or mismatched full map cannot reset the manager's gap backoff: \(invalid)")
+        }
+        _ = gapOwner.observe([[1_000, 2_000], [4_000, 60_000]])
+        gapOwner.torrentPauseBufferManuallyStopped = true
+        let stoppedRepairCalls = gapOwner.torrentPauseBuffer.repairCalls
+        let stoppedStarts = gapOwner.torrentPauseBuffer.starts
+        gapOwner.update()
+        check(gapOwner.torrentPauseBuffer.repairCalls == stoppedRepairCalls && gapOwner.torrentPauseBuffer.starts == stoppedStarts,
+              "Explicit Stop dominates even a fresh resident hole")
+        gapOwner.torrentPauseBufferManuallyStopped = false
+        gapOwner.torrentPauseBuffer.handlesRepair = true
+        gapOwner.torrentAppliedPlaybackWindow!.prefetchCapacityStop = proof
+        gapOwner.update()
+        check(gapOwner.torrentPauseBuffer.lastCapacityStop == proof,
+              "The bounded repair receives the current exact capacity-stop receipt")
+        gapOwner.core!.sourcePlaybackWindow.seekGeneration = 2
+        let beforeSeekRepair = gapOwner.torrentPauseBuffer.repairCalls
+        gapOwner.update()
+        check(gapOwner.torrentPauseBuffer.repairCalls == beforeSeekRepair && gapOwner.torrentPauseBuffer.snapshot.state == .idle,
+              "A new seek cannot use the old worker ACK or resident observation")
         print("Torrent prefetch lifecycle checks passed (\(assertions) assertions).")
     }
 }

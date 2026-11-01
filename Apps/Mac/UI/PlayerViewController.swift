@@ -257,6 +257,16 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     private var torrentResolving = false
     private var torrentLastStatus: SPTorrentStatus?
     private var torrentLastCacheSnapshot: SPTorrentCacheSnapshot?
+    private struct TorrentCacheRefillObservation {
+        let id: UUID
+        let cache: SPTorrentCacheSnapshot
+        let leaseID: UUID
+        let openGeneration: Int64
+        let seekGeneration: Int64
+        let policyEpoch: UUID
+        let requestedAt: TimeInterval
+    }
+    private var torrentCacheRefillObservation: TorrentCacheRefillObservation?
     private var torrentTimelinePresentation: SPTorrentTimelinePresentation?
     private var torrentLoadingView: SPTorrentLoadingView?
     private var torrentMagnetSheet: SPTorrentMagnetSheet?
@@ -3672,8 +3682,37 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             return
         }
         guard !torrentPauseBufferManuallyStopped else { return }
-        torrentPauseBuffer.start(identity: .init(hash: context.descriptor.hash, fileID: context.file.id,
-            sessionGeneration: context.descriptor.leaseID), streamURL: context.streamURL,
+        let identity = SPTorrentPauseBuffer.Identity(hash: context.descriptor.hash, fileID: context.file.id,
+                                                   sessionGeneration: context.descriptor.leaseID)
+        var refillPlan: SPTorrentCacheRefillPlan?
+        var gap: SPTorrentPauseBuffer.ResidentGap?
+        if let observation = torrentCacheRefillObservation,
+           observation.leaseID == context.descriptor.leaseID,
+           observation.openGeneration == source.openGeneration,
+           observation.seekGeneration == source.seekGeneration,
+           observation.policyEpoch == torrentPlaybackWindowEpoch,
+           observation.requestedAt.isFinite,
+           ProcessInfo.processInfo.systemUptime >= observation.requestedAt,
+           ProcessInfo.processInfo.systemUptime - observation.requestedAt <= 5,
+           source.playbackOffset >= applied.historyLowerBound {
+            refillPlan = SPTorrentCacheRefillPlan(cache: observation.cache, file: context.file,
+                playbackOffset: source.playbackOffset, forwardUpperBound: applied.forwardUpperBound)
+            if let missing = refillPlan?.missingRange {
+                gap = .init(observationID: observation.id, start: missing.lowerBound, end: missing.upperBound)
+            }
+        }
+        // Keep an active bounded repair even if a poll temporarily fails. A
+        // fresh, fully resident map needs no additional whole-window read.
+        if torrentPauseBuffer.repairResidentGap(identity: identity, streamURL: context.streamURL,
+            fileLength: context.file.length, approvedLowerBound: max(applied.historyLowerBound, source.playbackOffset),
+            approvedUpperBound: applied.forwardUpperBound, gap: gap,
+            capacityStop: applied.prefetchCapacityStop,
+            confirmedResidentCoverage: refillPlan.map { $0.missingRange == nil } ?? false) { return }
+        if let refillPlan, refillPlan.missingRange == nil,
+           torrentPauseBuffer.snapshot.state == .filled || torrentPauseBuffer.snapshot.state == .waitingForCapacity {
+            return
+        }
+        torrentPauseBuffer.start(identity: identity, streamURL: context.streamURL,
             offset: max(core.sourceReadOffset, applied.historyLowerBound), fileLength: context.file.length,
             forwardEndOffset: applied.forwardUpperBound, capacityStop: applied.prefetchCapacityStop)
     }
@@ -3893,11 +3932,28 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
                     self.refreshPlaylistView()
                     self.updateTorrentLoadingForCoreState(self.core?.state ?? .idle)
                     do {
+                        let cacheSource = self.core?.sourcePlaybackWindow
+                        let cachePolicyEpoch = self.torrentPlaybackWindowEpoch
+                        let cacheRequestedAt = ProcessInfo.processInfo.systemUptime
                         let cached = try await SPTorrentServer.shared.cacheSnapshot(context.descriptor, file: context.file)
                         guard !Task.isCancelled,
                               self.torrentContext?.descriptor.leaseID == context.descriptor.leaseID,
                               self.torrentContext?.file.id == context.file.id else { return }
+                        if let cacheSource, let current = self.core?.sourcePlaybackWindow,
+                           cacheSource.openGeneration >= 0, cacheSource.seekGeneration >= 0,
+                           cacheSource.openGeneration == current.openGeneration,
+                           cacheSource.seekGeneration == current.seekGeneration,
+                           cachePolicyEpoch == self.torrentPlaybackWindowEpoch,
+                           self.core?.seekSettled == true {
+                            self.torrentCacheRefillObservation = .init(id: UUID(), cache: cached,
+                                leaseID: context.descriptor.leaseID, openGeneration: cacheSource.openGeneration,
+                                seekGeneration: cacheSource.seekGeneration, policyEpoch: cachePolicyEpoch,
+                                requestedAt: cacheRequestedAt)
+                        } else {
+                            self.torrentCacheRefillObservation = nil
+                        }
                         self.applyTorrentCacheSnapshot(cached, context: context)
+                        self.updateTorrentPauseBuffer()
                         self.refreshPlaylistView()
                     } catch is CancellationError { return }
                     catch {
@@ -3924,6 +3980,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
 
     private func clearTorrentCacheTimeline(visible: Bool) {
         torrentLastCacheSnapshot = nil
+        torrentCacheRefillObservation = nil
         torrentTimelinePresentation = nil
         chrome?.setBufferedRanges([], visible: visible)
         floatingVideo.setBufferedRanges([], visible: visible)

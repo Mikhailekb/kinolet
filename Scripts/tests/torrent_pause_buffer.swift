@@ -27,6 +27,7 @@ struct TorrentPauseBufferChecks {
         port = fixturePort
         eventFile = URL(fileURLWithPath: CommandLine.arguments[2])
         do {
+            try await residentGapChecks()
             try await automaticRecoveryChecks()
             try await capacityProofChecks()
             try await exactWindowChecks()
@@ -42,6 +43,238 @@ struct TorrentPauseBufferChecks {
             print("FAIL: \(error)")
             exit(1)
         }
+    }
+
+    static func residentGapChecks() async throws {
+        var now: TimeInterval = 0
+        let manager = SPTorrentPauseBuffer(residentRepairClock: { now })
+        let source = url("valid", "resident-gap-completed")
+        let upper: Int64 = 1_024 * 1_024
+        let first = SPTorrentPauseBuffer.ResidentGap(observationID: UUID(), start: 96 * 1_024, end: 160 * 1_024)
+        func repair(_ gap: SPTorrentPauseBuffer.ResidentGap?,
+                    candidateIdentity: SPTorrentPauseBuffer.Identity = identity,
+                    candidateSource: URL? = nil, candidateLength: Int64 = fileLength,
+                    lower: Int64 = 0, bound: Int64? = nil) -> Bool {
+            manager.repairResidentGap(identity: candidateIdentity, streamURL: candidateSource ?? source,
+                fileLength: candidateLength, approvedLowerBound: lower, approvedUpperBound: bound ?? upper, gap: gap)
+        }
+        check(!repair(first) && manager.snapshot == .idle,
+              "an unbound resident observation cannot create a new source or request")
+        manager.start(identity: identity, streamURL: source, offset: 0,
+                      fileLength: fileLength, forwardEndOffset: upper)
+        try await awaitState(manager, .filled)
+        let full = manager.snapshot
+        check(full.receivedBytes == upper && requests("resident-gap-completed").count == 1,
+              "the historical finite HTTP read can complete before a resident hole is observed")
+        let otherIdentity = SPTorrentPauseBuffer.Identity(hash: identity.hash, fileID: identity.fileID,
+                                                         sessionGeneration: UUID())
+        check(!repair(first, candidateIdentity: otherIdentity) &&
+              !repair(first, candidateSource: url("valid", "another-resident-source")) &&
+              !repair(first, candidateLength: fileLength - 1),
+              "a resident repair cannot borrow another lease, URL or file length")
+        for invalid in [SPTorrentPauseBuffer.ResidentGap(observationID: UUID(), start: -1, end: 100),
+                        .init(observationID: UUID(), start: 100, end: 100),
+                        .init(observationID: UUID(), start: upper - 1, end: upper + 1)] {
+            check(!repair(invalid) && manager.snapshot == full,
+                  "an invalid or unapproved resident extent cannot invalidate delivered coverage")
+        }
+        check(!repair(first, lower: first.start + 1) && !repair(first, bound: first.end - 1) &&
+              requests("resident-gap-completed").count == 1,
+              "both ends of a repair remain inside the current acknowledged worker window")
+        check(repair(first) && manager.snapshot.state == .filling &&
+              manager.snapshot.rangeStart == first.start && manager.snapshot.rangeEnd == first.end - 1 &&
+              manager.snapshot.receivedBytes == 0,
+              "fresh residency invalidates only the missing extent despite a completed old HTTP prefix")
+        try await awaitState(manager, .filled)
+        var reads = requests("resident-gap-completed")
+        check(reads.count == 2 && reads[1]["range"] as? String == "bytes=\(first.start)-\(first.end - 1)" &&
+              requestID(reads[0]) != requestID(reads[1]),
+              "resident recovery actually reads only the missing bytes using a fresh request nonce")
+        for _ in 0..<20 { check(repair(first), "the consumed resident observation continues to own terminal polling") }
+        check(requests("resident-gap-completed").count == 2,
+              "one resident observation cannot trigger a repeated finite HTTP loop")
+        let repeated = SPTorrentPauseBuffer.ResidentGap(observationID: UUID(), start: first.start, end: first.end)
+        check(repair(repeated) && requests("resident-gap-completed").count == 2,
+              "a fresh but unchanged resident hole waits for bounded non-progress backoff")
+        now = 3
+        check(repair(repeated), "a fresh unchanged observation is eligible after the first three-second backoff")
+        try await awaitState(manager, .filled)
+        check(requests("resident-gap-completed").count == 3,
+              "non-progress recovery eventually retries instead of requiring manual Resume")
+        now = 8.99
+        check(repair(.init(observationID: UUID(), start: first.start, end: first.end)) &&
+              requests("resident-gap-completed").count == 3,
+              "the next unchanged hole uses the longer six-second backoff")
+        now = 9
+        check(repair(.init(observationID: UUID(), start: first.start, end: first.end)),
+              "the second bounded recovery can start after its longer delay")
+        try await awaitState(manager, .filled)
+        check(requests("resident-gap-completed").count == 4,
+              "each non-progress retry contributes one finite request")
+        now = 9.1
+        check(!repair(nil) && repair(.init(observationID: UUID(), start: first.start, end: first.end)) &&
+              requests("resident-gap-completed").count == 4,
+              "an unknown cache observation cannot clear the non-progress backoff")
+        check(!manager.repairResidentGap(identity: identity, streamURL: source, fileLength: fileLength,
+            approvedLowerBound: 0, approvedUpperBound: upper, gap: nil, confirmedResidentCoverage: true),
+              "a confirmed fully resident terminal window needs no replacement HTTP request")
+        check(repair(.init(observationID: UUID(), start: first.start, end: first.end)),
+              "fresh eviction of a previously resident extent is repaired immediately despite its old backoff")
+        try await awaitState(manager, .filled)
+        check(requests("resident-gap-completed").count == 5,
+              "the resident checkpoint resets only delay rather than downloading the complete old window")
+        now = 12.09
+        check(repair(.init(observationID: UUID(), start: first.start, end: first.end)) &&
+              requests("resident-gap-completed").count == 5,
+              "post-checkpoint non-progress starts again at the initial three-second delay")
+        now = 12.1
+        check(repair(.init(observationID: UUID(), start: first.start, end: first.end)),
+              "the reset initial backoff does not retain an obsolete twelve-second retry index")
+        try await awaitState(manager, .filled)
+        check(requests("resident-gap-completed").count == 6,
+              "post-checkpoint retry remains one finite missing-range request")
+        now = 100
+        check(repair(first) && requests("resident-gap-completed").count == 6,
+              "replaying an earlier consumed observation cannot restart after a later receipt")
+        let progressed = SPTorrentPauseBuffer.ResidentGap(observationID: UUID(), start: 192 * 1_024, end: 224 * 1_024)
+        check(repair(progressed), "a changed missing extent does not inherit a different hole's backoff")
+        try await awaitState(manager, .filled)
+        reads = requests("resident-gap-completed")
+        check(reads.count == 7 && reads.last?["range"] as? String == "bytes=\(progressed.start)-\(progressed.end - 1)",
+              "newly missing residency is repaired without replaying an already resident prefix")
+        check(!repair(nil), "terminal recovery requires a fresh authoritative missing extent")
+        manager.stop()
+        check(manager.snapshot.state == .filled &&
+              !repair(.init(observationID: UUID(), start: first.start, end: first.end)) &&
+              requests("resident-gap-completed").count == 7,
+              "explicit Stop also suppresses resident repair after HTTP delivery was already full")
+        manager.start(identity: identity, streamURL: source, offset: progressed.start,
+                      fileLength: fileLength, forwardEndOffset: progressed.end)
+        check(repair(.init(observationID: UUID(), start: first.start, end: first.end)),
+              "an explicit ordinary Resume re-enables resident recovery")
+        try await awaitState(manager, .filled)
+        check(requests("resident-gap-completed").count == 8,
+              "resumed recovery still makes only one exact missing-range request")
+        manager.cancel()
+        check(!repair(first) && manager.snapshot == .idle,
+              "source cancellation revokes the old observation's authority")
+
+        let capacity = SPTorrentPauseBuffer()
+        let capacityTag = "resident-gap-capacity"
+        let capacityURL = capacitySource(capacityTag)
+        let capacityUpper: Int64 = 256 * 1_024
+        _ = try await capacityState(capacityTag, upper: capacityUpper)
+        capacity.start(identity: identity, streamURL: capacityURL, offset: 0,
+                       fileLength: fileLength, forwardEndOffset: 2 * capacityUpper)
+        try await awaitTransientFailure(capacity)
+        let oldProof = capacityProof(try await capacityState(capacityTag))!
+        capacity.start(identity: identity, streamURL: capacityURL, offset: 0,
+                       fileLength: fileLength, forwardEndOffset: capacityUpper, capacityStop: oldProof)
+        check(capacity.snapshot.state == .waitingForCapacity && capacity.snapshot.receivedBytes == capacityUpper,
+              "a proof-bearing capacity wait can retain only historical HTTP-delivery coverage")
+        let capacityGap = SPTorrentPauseBuffer.ResidentGap(observationID: UUID(), start: 64 * 1_024, end: 128 * 1_024)
+        check(capacity.repairResidentGap(identity: identity, streamURL: capacityURL, fileLength: fileLength,
+            approvedLowerBound: 0, approvedUpperBound: capacityUpper, gap: capacityGap, capacityStop: oldProof),
+              "a fresh resident hole reopens a parked capacity window without moving its retention anchor")
+        try await awaitState(capacity, .filled)
+        let capacityReads = requests(capacityTag)
+        check(capacityReads.count == 2 && capacityReads.last?["range"] as? String == "bytes=65536-131071" &&
+              requestID(capacityReads[0]) != requestID(capacityReads[1]),
+              "the old capacity receipt cannot suppress or authorize a different gap request nonce")
+
+        let active = SPTorrentPauseBuffer()
+        let activeTag = "resident-gap-active"
+        let activeURL = url("gated-growth", activeTag)
+        let gate = eventFile.deletingLastPathComponent().appendingPathComponent("hold-growing-target")
+        defer { try? FileManager.default.removeItem(at: gate) }
+        active.start(identity: identity, streamURL: activeURL, offset: 0,
+                     fileLength: fileLength, forwardEndOffset: upper)
+        check(!active.repairResidentGap(identity: identity, streamURL: activeURL, fileLength: fileLength,
+            approvedLowerBound: 0, approvedUpperBound: upper, gap: first),
+              "resident repair does not interrupt an ordinary finite reader that is still filling")
+        try await awaitState(active, .filled)
+        try Data().write(to: gate)
+        let activeGap = SPTorrentPauseBuffer.ResidentGap(observationID: UUID(), start: 128 * 1_024, end: 640 * 1_024)
+        check(active.repairResidentGap(identity: identity, streamURL: activeURL, fileLength: fileLength,
+            approvedLowerBound: 0, approvedUpperBound: upper, gap: activeGap),
+              "an owned gate holds a real bounded gap reader in flight")
+        try await wait { active.snapshot.receivedBytes > 0 && !events(activeTag, kind: "gated").isEmpty }
+        for _ in 0..<20 {
+            check(active.repairResidentGap(identity: identity, streamURL: activeURL, fileLength: fileLength,
+                approvedLowerBound: 0, approvedUpperBound: upper, gap: nil),
+                  "temporarily unknown resident snapshots cannot replace an active gap reader")
+        }
+        check(requests(activeTag).count == 2 && active.snapshot.rangeStart == activeGap.start &&
+              active.snapshot.rangeEnd == activeGap.end - 1,
+              "frequent ordinary polling leaves the same real finite gap request alive")
+        let clippedUpper: Int64 = 512 * 1_024
+        check(active.repairResidentGap(identity: identity, streamURL: activeURL, fileLength: fileLength,
+            approvedLowerBound: 0, approvedUpperBound: clippedUpper, gap: nil),
+              "contracting worker bounds clips a repair even without a new resident snapshot")
+        try await wait { requests(activeTag).count == 3 }
+        check(active.snapshot.rangeEnd == clippedUpper - 1 &&
+              requests(activeTag).last?["range"] as? String == "bytes=196608-524287",
+              "clipped recovery keeps delivered bytes and requests only the still-approved suffix")
+        try FileManager.default.removeItem(at: gate)
+        try await awaitState(active, .filled)
+        try Data().write(to: gate)
+        let withdrawn = SPTorrentPauseBuffer.ResidentGap(observationID: UUID(), start: 700 * 1_024, end: 900 * 1_024)
+        check(active.repairResidentGap(identity: identity, streamURL: activeURL, fileLength: fileLength,
+            approvedLowerBound: 0, approvedUpperBound: upper, gap: withdrawn),
+              "a later hole can create a new bounded repair")
+        try await wait { active.snapshot.receivedBytes > 0 }
+        check(!active.repairResidentGap(identity: identity, streamURL: activeURL, fileLength: fileLength,
+            approvedLowerBound: 900 * 1_024, approvedUpperBound: upper, gap: nil) && active.snapshot == .idle,
+              "withdrawing the entire approved repair extent cancels it immediately")
+        try FileManager.default.removeItem(at: gate)
+        try await Task.sleep(for: .milliseconds(100))
+        check(active.snapshot == .idle, "late cancelled gap callbacks cannot resurrect a withdrawn read")
+
+        let tail = SPTorrentPauseBuffer()
+        let tailTag = "resident-gap-metadata-tail"
+        let tailURL = url("gated-growth", tailTag)
+        let tailStart = 2 * upper
+        try Data().write(to: gate)
+        tail.start(identity: identity, streamURL: tailURL, offset: tailStart,
+                   fileLength: fileLength, forwardEndOffset: tailStart + upper)
+        try await wait { tail.snapshot.receivedBytes > 0 && !events(tailTag, kind: "gated").isEmpty }
+        check(!tail.repairResidentGap(identity: identity, streamURL: tailURL, fileLength: fileLength,
+            approvedLowerBound: 0, approvedUpperBound: 4 * upper,
+            gap: .init(observationID: UUID(), start: tailStart - 1, end: tailStart + 1)),
+              "a gap overlapping a live finite request cannot preempt it ambiguously")
+        check(tail.repairResidentGap(identity: identity, streamURL: tailURL, fileLength: fileLength,
+            approvedLowerBound: 0, approvedUpperBound: 4 * upper, gap: first),
+              "a proven earlier gap can preempt an unrelated live metadata-tail request")
+        try await awaitState(tail, .filled)
+        let repairedTail = tail.snapshot
+        let tailReads = requests(tailTag)
+        check(tailReads.count == 2 && tailReads[0]["range"] as? String == "bytes=\(tailStart)-\(tailStart + upper - 1)" &&
+              tailReads[1]["range"] as? String == "bytes=\(first.start)-\(first.end - 1)" &&
+              requestID(tailReads[0]) != requestID(tailReads[1]),
+              "metadata-tail preemption requests exactly the earlier missing extent with a new nonce")
+        try FileManager.default.removeItem(at: gate)
+        try await Task.sleep(for: .milliseconds(150))
+        check(tail.snapshot == repairedTail && tail.snapshot.receivedBytes == first.end - first.start &&
+              requests(tailTag).count == 2,
+              "late cancelled metadata-tail callbacks cannot inflate or replace repaired gap coverage")
+
+        let stopped = SPTorrentPauseBuffer()
+        let stoppedURL = url("slow", "resident-gap-stopped")
+        stopped.start(identity: identity, streamURL: stoppedURL, offset: 0,
+                      fileLength: fileLength, forwardEndOffset: upper)
+        stopped.stop()
+        check(!stopped.repairResidentGap(identity: identity, streamURL: stoppedURL, fileLength: fileLength,
+            approvedLowerBound: 0, approvedUpperBound: upper, gap: first) && stopped.snapshot.state == .stopped,
+              "a resident observation cannot resume an explicitly stopped manager")
+        let failed = SPTorrentPauseBuffer()
+        let failedURL = url("wrong-start", "resident-gap-failed")
+        failed.start(identity: identity, streamURL: failedURL, offset: 0,
+                     fileLength: fileLength, forwardEndOffset: upper)
+        try await awaitState(failed, .failed)
+        let failure = failed.snapshot
+        check(!failed.repairResidentGap(identity: identity, streamURL: failedURL, fileLength: fileLength,
+            approvedLowerBound: 0, approvedUpperBound: upper, gap: first) && failed.snapshot == failure,
+              "residency does not bypass a sticky invalid HTTP response")
     }
 
     static func automaticRecoveryChecks() async throws {

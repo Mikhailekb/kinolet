@@ -14,6 +14,14 @@ final class SPTorrentPauseBuffer {
         let sessionGeneration: UUID
     }
 
+    /// One missing resident extent from an authoritative cache observation.
+    /// The observation belongs to the owner's current playback/cache epoch.
+    struct ResidentGap: Equatable, Sendable {
+        let observationID: UUID
+        let start: Int64
+        let end: Int64 // Exclusive, normally the next complete resident extent.
+    }
+
     enum State: Equatable, Sendable { case idle, filling, filled, waitingForCapacity, stopped, failed }
 
     /// Deliberately contains no server URL, credentials or raw network error.
@@ -77,11 +85,24 @@ final class SPTorrentPauseBuffer {
     private var retryTask: Task<Void, Never>?
     private var retryAttempt = 0
     private let retryDelays: [Duration]
+    private let residentRepairClock: @MainActor () -> TimeInterval
+    private var residentRepairStopped = false
+    private var residentRepairWindow: Window?
+    private struct ResidentRepairReceipt {
+        let window: Window
+        let notBefore: TimeInterval
+        let nextBackoffIndex: Int
+    }
+    private var residentRepairReceipt: ResidentRepairReceipt?
+    private var residentRepairObservations: Set<UUID> = []
+    private var residentRepairObservationOrder: [UUID] = []
 
-    init(retryDelays: [Duration] = [.seconds(3), .seconds(6), .seconds(12), .seconds(15)]) {
+    init(retryDelays: [Duration] = [.seconds(3), .seconds(6), .seconds(12), .seconds(15)],
+         residentRepairClock: @escaping @MainActor () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
         // Normal paused window ACKs refresh every two seconds. The initial
         // grace lets their exact capacity proof arrive before a new nonce.
         self.retryDelays = retryDelays.isEmpty ? [.seconds(3)] : retryDelays.map { max(.milliseconds(1), $0) }
+        self.residentRepairClock = residentRepairClock
     }
 
     deinit {
@@ -99,6 +120,119 @@ final class SPTorrentPauseBuffer {
     func start(identity: Identity, streamURL: URL, offset: Int64,
                fileLength: Int64, forwardEndOffset: Int64,
                capacityStop: SPTorrentPrefetchCapacityStop? = nil) {
+        residentRepairStopped = false
+        residentRepairWindow = nil
+        startApprovedWindow(identity: identity, streamURL: streamURL, offset: offset,
+            fileLength: fileLength, forwardEndOffset: forwardEndOffset, capacityStop: capacityStop)
+    }
+
+    /// Reopens a completed HTTP extent only when a fresh resident map proves
+    /// that some of its bytes are absent. HTTP delivery is not cache residency.
+    /// Returns true while the repair owns the manager, including observation
+    /// deduplication/backoff, so ordinary read-cursor polling cannot replace it.
+    /// Only a fresh matching map with no gap may confirm resident coverage;
+    /// a nil/unknown observation alone never resets non-progress backoff.
+    @discardableResult
+    func repairResidentGap(identity: Identity, streamURL: URL, fileLength: Int64,
+                           approvedLowerBound: Int64, approvedUpperBound: Int64,
+                           gap: ResidentGap?, capacityStop: SPTorrentPrefetchCapacityStop? = nil,
+                           confirmedResidentCoverage: Bool = false) -> Bool {
+        guard !residentRepairStopped, !identity.hash.isEmpty, identity.fileID >= 0, fileLength > 0,
+              approvedLowerBound >= 0, approvedUpperBound >= approvedLowerBound,
+              approvedUpperBound <= fileLength, let source = SPTorrentPauseSource(streamURL),
+              let previous = window, previous.identity == identity,
+              previous.source == source, previous.fileLength == fileLength else { return false }
+
+        if confirmedResidentCoverage, gap == nil, let receipt = residentRepairReceipt,
+           receipt.window.identity == identity, receipt.window.source == source,
+           receipt.window.fileLength == fileLength {
+            let now = residentRepairClock()
+            if now.isFinite {
+                // A confirmed resident checkpoint is real progress. Future
+                // eviction of the same extent must not inherit its old delay;
+                // keep observation receipts so stale samples still cannot replay.
+                residentRepairReceipt = ResidentRepairReceipt(window: receipt.window,
+                    notBefore: now, nextBackoffIndex: 0)
+            }
+        }
+
+        if let active = residentRepairWindow, active.identity == identity,
+           active.source == source, active.fileLength == fileLength,
+           snapshot.state == .filling, reader != nil || retryTask != nil {
+            let lower = max(active.start, approvedLowerBound)
+            let upper = min(active.end, approvedUpperBound)
+            guard lower < upper else {
+                // The owner has withdrawn the whole repaired extent. Do not
+                // keep reading outside the latest acknowledged worker window.
+                invalidateRead()
+                residentRepairWindow = nil
+                window = nil
+                coveredEndOffset = 0
+                requestStartOffset = 0
+                publish(.idle)
+                return false
+            }
+            residentRepairWindow = Window(identity: identity, source: source, start: lower,
+                                          end: upper, fileLength: fileLength)
+            startApprovedWindow(identity: identity, streamURL: streamURL, offset: lower,
+                fileLength: fileLength, forwardEndOffset: upper, capacityStop: capacityStop)
+            return true
+        }
+
+        guard let gap,
+              gap.start >= approvedLowerBound, gap.end <= approvedUpperBound,
+              gap.start < gap.end else { return false }
+        let terminal = (snapshot.state == .filled || snapshot.state == .waitingForCapacity) &&
+            reader == nil && retryTask == nil
+        // A metadata-driven tail request cannot ever fill a proven gap wholly
+        // before its starting offset. It may yield to that earlier playback
+        // need; a reader that still covers the gap must remain undisturbed.
+        let uncoveredEarlierGap = residentRepairWindow == nil && snapshot.state == .filling &&
+            (reader != nil || retryTask != nil) && gap.end <= requestStartOffset
+        guard terminal || uncoveredEarlierGap else { return false }
+        let next = Window(identity: identity, source: source, start: gap.start,
+                          end: gap.end, fileLength: fileLength)
+        let now = residentRepairClock()
+        guard now.isFinite else { return false }
+        let receipt = residentRepairReceipt
+        let sameContext = receipt.map {
+            $0.window.identity == identity && $0.window.source == source && $0.window.fileLength == fileLength
+        } ?? false
+        if !sameContext {
+            residentRepairObservations.removeAll(keepingCapacity: true)
+            residentRepairObservationOrder.removeAll(keepingCapacity: true)
+        }
+        if residentRepairObservations.contains(gap.observationID) { return true }
+        let sameGap = sameContext && receipt?.window == next
+        if sameGap, let receipt, now < receipt.notBefore { return true }
+        let backoffIndex = sameGap ? (receipt?.nextBackoffIndex ?? 0) : 0
+        let delay = retryDelays[min(backoffIndex, retryDelays.count - 1)].components
+        let seconds = Double(delay.seconds) + Double(delay.attoseconds) / 1e18
+        residentRepairReceipt = ResidentRepairReceipt(window: next,
+            notBefore: now + seconds, nextBackoffIndex: min(backoffIndex + 1, retryDelays.count - 1))
+        residentRepairObservations.insert(gap.observationID)
+        residentRepairObservationOrder.append(gap.observationID)
+        // The owner accepts only fresh observations. Keep a bounded replay
+        // history as an additional guard against its frequent polling.
+        if residentRepairObservationOrder.count > 64 {
+            residentRepairObservations.remove(residentRepairObservationOrder.removeFirst())
+        }
+
+        // Invalidate only our delivered-prefix assumption and HTTP nonce. The
+        // worker's playback window and useful resident pieces remain untouched.
+        invalidateRead()
+        residentRepairWindow = next
+        window = next
+        coveredEndOffset = next.start
+        requestStartOffset = next.start
+        retryAttempt = 0
+        beginRead(next)
+        return true
+    }
+
+    private func startApprovedWindow(identity: Identity, streamURL: URL, offset: Int64,
+                                     fileLength: Int64, forwardEndOffset: Int64,
+                                     capacityStop: SPTorrentPrefetchCapacityStop?) {
         guard !identity.hash.isEmpty, identity.fileID >= 0,
               offset >= 0, fileLength > 0, offset <= fileLength,
               forwardEndOffset >= 0, forwardEndOffset <= fileLength,
@@ -221,6 +355,11 @@ final class SPTorrentPauseBuffer {
     /// Stop immediately, preserving only the response-validated contiguous prefix
     /// of this same window. No response body is retained by this object.
     func stop() {
+        residentRepairStopped = true
+        residentRepairWindow = nil
+        residentRepairReceipt = nil
+        residentRepairObservations.removeAll(keepingCapacity: true)
+        residentRepairObservationOrder.removeAll(keepingCapacity: true)
         guard let window else { return }
         let hadRead = reader != nil
         let received = invalidateRead()
@@ -231,6 +370,11 @@ final class SPTorrentPauseBuffer {
 
     /// Seek/source changes invalidate the cache-coverage assumption.
     func cancel() {
+        residentRepairStopped = false
+        residentRepairWindow = nil
+        residentRepairReceipt = nil
+        residentRepairObservations.removeAll(keepingCapacity: true)
+        residentRepairObservationOrder.removeAll(keepingCapacity: true)
         invalidateRead()
         retryAttempt = 0
         window = nil
