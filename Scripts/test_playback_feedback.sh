@@ -63,6 +63,7 @@ PY
 xcrun swiftc -swift-version 6 -parse-as-library \
   "$ROOT/Apps/Mac/UI/Localization.swift" \
   "$ROOT/Apps/Mac/UI/FloatingVideoController.swift" \
+  "$ROOT/Apps/Mac/UI/VolumeIcon.swift" \
   "$ROOT/Apps/Mac/UI/PlaybackFeedbackView.swift" \
   "$CHECK_DIR/pip-feedback.swift" -o "$CHECK_DIR/pip-feedback-checks"
 "$CHECK_DIR/pip-feedback-checks" "$@"

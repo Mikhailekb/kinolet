@@ -123,6 +123,8 @@ jobs:
           run_check ./Scripts/test_video_context_menu.sh
           run_check ./Scripts/test_video_context_policy.sh
           run_check ./Scripts/test_floating_video.sh
+          run_check ./Scripts/test_volume_icon.sh
+          run_check ./Scripts/test_motion_button.sh
           run_check ./Scripts/test_buffered_timeline.sh
           run_check ./Scripts/test_particle_buffered_timeline.sh
           run_check ./Scripts/test_cached_timeline.sh

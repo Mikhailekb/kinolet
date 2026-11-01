@@ -126,20 +126,10 @@ final class SPVolumeFeedbackView: NSView {
         displayedMuted = muted
         value.stringValue = percentFormatter.string(from: NSNumber(value: displayedPercent / 100)) ??
             String(format: "%.0f%%", displayedPercent)
-        let symbol: String
-        if muted || displayedPercent == 0 {
-            symbol = "speaker.slash.fill"
-        } else if displayedPercent < 34 {
-            symbol = "speaker.wave.1.fill"
-        } else if displayedPercent < 67 {
-            symbol = "speaker.wave.2.fill"
-        } else {
-            symbol = "speaker.wave.3.fill"
-        }
+        let symbol = SPVolumeIcon.level(percent: displayedPercent, muted: muted).symbolName
         if displayedSpeakerSymbol != symbol {
             displayedSpeakerSymbol = symbol
-            speaker.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
-                .withSymbolConfiguration(.init(pointSize: 18, weight: .medium))
+            speaker.image = SPVolumeIcon.image(percent: displayedPercent, muted: muted, pointSize: 18)
         }
         layer?.removeAllAnimations()
         alphaValue = 1

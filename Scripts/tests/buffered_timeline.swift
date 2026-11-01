@@ -76,6 +76,12 @@ struct BufferedTimelineChecks {
         image.colorAt(x: Int(x * Double(image.pixelsWide)), y: image.pixelsHigh / 2)!
             .usingColorSpace(.deviceRGB)!.redComponent
     }
+    static func orange(_ image: NSBitmapImageRep, x: Double) -> Bool {
+        let color = image.colorAt(x: Int(x * Double(image.pixelsWide)), y: image.pixelsHigh / 2)!
+            .usingColorSpace(.sRGB)!
+        return color.redComponent > 0.95 && abs(color.greenComponent - 182 / 255) < 0.04 &&
+            abs(color.blueComponent - 92 / 255) < 0.04
+    }
     static func main() throws {
         NSApplication.shared.setActivationPolicy(.prohibited)
         setbuf(stdout, nil)
@@ -91,14 +97,13 @@ struct BufferedTimelineChecks {
         view.setValue(0.2)
         let initial = pixels(view)
         expect(white(initial, x: 0.1) > 0.95, "Played media remains white above cached coverage")
-        expect(white(initial, x: 0.25) > 0.6 && white(initial, x: 0.25) < 0.7,
-               "Resident forward media is neutral light gray")
+        expect(orange(initial, x: 0.25), "Resident forward media uses the existing Turbo orange")
         expect(white(initial, x: 0.4) < 0.25 && white(initial, x: 0.7) < 0.25,
                "Uncached gaps stay visibly dark")
-        expect(white(initial, x: 0.55) > 0.6 && white(initial, x: 0.85) > 0.6,
+        expect(orange(initial, x: 0.55) && orange(initial, x: 0.85),
                "Discontinuous cached segments are drawn at their supplied media times")
         view.setBufferedRanges([0.1...0.3, 0.8...0.9], visible: true)
-        expect(white(pixels(view), x: 0.55) < 0.25, "Evicted cache immediately removes its previous gray segment")
+        expect(white(pixels(view), x: 0.55) < 0.25, "Evicted cache immediately removes its previous orange segment")
         view.setBufferedRanges([], visible: true)
         expect(white(pixels(view), x: 0.8) < 0.25 && !shape(view, "base").isHidden,
                "A visible empty torrent cache keeps an honest unloaded rail")

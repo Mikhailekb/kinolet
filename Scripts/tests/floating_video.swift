@@ -64,7 +64,7 @@ struct FloatingVideoChecks {
         try bitmap.representation(using: .png, properties: [:])!.write(to: path)
     }
 
-    static func barWhite(_ slider: NSSlider, at fraction: Double) -> Double {
+    static func barColor(_ slider: NSSlider, at fraction: Double) -> NSColor {
         let originalFrame = slider.frame
         slider.setFrameSize(NSSize(width: 400, height: 20))
         defer { slider.frame = originalFrame }
@@ -77,7 +77,17 @@ struct FloatingVideoChecks {
         NSRect(x: 0, y: 0, width: 400, height: 20).fill()
         (slider.cell as! NSSliderCell).draw(withFrame: slider.bounds, in: slider)
         NSGraphicsContext.restoreGraphicsState()
-        return bitmap.colorAt(x: Int(fraction * 400), y: 10)!.usingColorSpace(.deviceRGB)!.redComponent
+        return bitmap.colorAt(x: Int(fraction * 400), y: 10)!.usingColorSpace(.sRGB)!
+    }
+
+    static func barWhite(_ slider: NSSlider, at fraction: Double) -> Double {
+        barColor(slider, at: fraction).redComponent
+    }
+
+    static func barOrange(_ slider: NSSlider, at fraction: Double) -> Bool {
+        let color = barColor(slider, at: fraction)
+        return color.redComponent > 0.95 && abs(color.greenComponent - 182 / 255) < 0.04 &&
+            abs(color.blueComponent - 92 / 255) < 0.04
     }
 
     static func sliderGeometryChecks() {
@@ -185,8 +195,8 @@ struct FloatingVideoChecks {
         expect(preservesAspect(video.bounds.size, ratio: 16 / 9, backingScale: panel.backingScaleFactor),
                "Video keeps its source aspect within one native pixel: video=\(video.bounds.size), content=\(content.bounds.size), frame=\(panel.frame.size), scale=\(panel.backingScaleFactor)")
         expect(controls.alphaValue == 0, "Paused video initially has no controls without hover")
-        expect(barWhite(timeline, at: 0.1) > 0.95 && barWhite(timeline, at: 0.55) > 0.72 &&
-               barWhite(timeline, at: 0.7) < 0.45, "PiP paints white played, gray cached and darker uncached regions")
+        expect(barWhite(timeline, at: 0.1) > 0.95 && barOrange(timeline, at: 0.55) &&
+               barWhite(timeline, at: 0.7) < 0.45, "PiP paints white played, orange cached and darker uncached regions")
         expect(barWhite(volume, at: 0.85) < 0.45, "The shared volume slider never inherits timeline cache coverage")
         controller.setBufferedRanges([], visible: true)
         expect(barWhite(timeline, at: 0.55) < 0.45 && controls.alphaValue == 0,

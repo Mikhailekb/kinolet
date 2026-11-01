@@ -17,15 +17,16 @@ struct SPMotionEffectsGate {
 @MainActor
 final class SPMotionButton: NSButton, CAAnimationDelegate {
     private enum Palette {
-        static let cyan = NSColor(srgbRed: 0.10, green: 0.83, blue: 0.98, alpha: 1)
-        static let violet = NSColor(srgbRed: 0.47, green: 0.31, blue: 0.98, alpha: 1)
-        static let pink = NSColor(srgbRed: 0.96, green: 0.25, blue: 0.69, alpha: 1)
+        // The same #FFB65C amber used by Turbo and boosted-volume controls.
+        static let amber = NSColor(srgbRed: 1, green: 0xB6 / 255, blue: 0x5C / 255, alpha: 1)
+        static let gold = NSColor(srgbRed: 1, green: 0xD9 / 255, blue: 0x8E / 255, alpha: 1)
+        static let orange = NSColor(srgbRed: 1, green: 0x94 / 255, blue: 0x40 / 255, alpha: 1)
     }
     private let surface = CALayer()
     private let liquid = CALayer()
     private let baseGradient = CAGradientLayer()
-    private let cyanCloud = CAGradientLayer()
-    private let pinkCloud = CAGradientLayer()
+    private let goldCloud = CAGradientLayer()
+    private let orangeCloud = CAGradientLayer()
     private let borderHost = CALayer()
     private let borderGradient = CAGradientLayer()
     private let borderMask = CAShapeLayer()
@@ -33,7 +34,11 @@ final class SPMotionButton: NSButton, CAAnimationDelegate {
     private let focusRing = CAShapeLayer()
     private let foreground = CALayer()
     private let frames = CAShapeLayer()
-    private let sparkle = CAShapeLayer()
+    private let generatedFrame = CAShapeLayer()
+    private let insertedPlus = CAShapeLayer()
+    private let fpsBadge = CALayer()
+    private let fpsText = CATextLayer()
+    private var fpsReadout = "—"
     private let orbitLights = [CALayer(), CALayer(), CALayer()]
     private var selected = false
     private var effectsVisible = false
@@ -51,6 +56,9 @@ final class SPMotionButton: NSButton, CAAnimationDelegate {
     private var lastToolTip = ""
     var preferredWidth: CGFloat { 36 }
     var hasInteractionFocus: Bool { keyboardFocused || accessibilityFocused }
+    // This custom layer layout uses Cocoa's upward Y axis. Unlike a standard
+    // NSButton cell, its CATextLayer and frame-strip must share that geometry.
+    override var isFlipped: Bool { false }
     override var acceptsFirstResponder: Bool { isEnabled && !refusesFirstResponder }
     override var mouseDownCanMoveWindow: Bool { false }
     override var isEnabled: Bool { didSet { updateAppearance(); updateEffectActivity() } }
@@ -92,10 +100,16 @@ final class SPMotionButton: NSButton, CAAnimationDelegate {
 
     private func buildLayers() {
         guard let layer else { return }
+        surface.name = "sp.motion.surface"
+        frames.name = "sp.motion.frames"
+        generatedFrame.name = "sp.motion.generatedFrame"
+        insertedPlus.name = "sp.motion.insertedPlus"
+        fpsBadge.name = "sp.motion.fpsBadge"
+        fpsText.name = "sp.motion.fpsText"
         halo.fillColor = NSColor.clear.cgColor
-        halo.strokeColor = Palette.violet.withAlphaComponent(0.28).cgColor
+        halo.strokeColor = Palette.amber.withAlphaComponent(0.28).cgColor
         halo.lineWidth = 1.2
-        halo.shadowColor = Palette.cyan.cgColor
+        halo.shadowColor = Palette.gold.cgColor
         halo.shadowOffset = .zero
         halo.shadowRadius = 7
         halo.shadowOpacity = 0.48
@@ -105,14 +119,14 @@ final class SPMotionButton: NSButton, CAAnimationDelegate {
         liquid.masksToBounds = true
         surface.addSublayer(liquid)
         baseGradient.colors = [
-            NSColor(srgbRed: 0.06, green: 0.29, blue: 0.42, alpha: 1).cgColor,
-            NSColor(srgbRed: 0.28, green: 0.16, blue: 0.57, alpha: 1).cgColor,
-            NSColor(srgbRed: 0.47, green: 0.12, blue: 0.38, alpha: 1).cgColor,
+            NSColor(srgbRed: 0.40, green: 0.20, blue: 0.07, alpha: 1).cgColor,
+            NSColor(srgbRed: 0.58, green: 0.29, blue: 0.09, alpha: 1).cgColor,
+            NSColor(srgbRed: 0.38, green: 0.15, blue: 0.055, alpha: 1).cgColor,
         ]
         baseGradient.startPoint = CGPoint(x: 0, y: 0)
         baseGradient.endPoint = CGPoint(x: 1, y: 1)
         liquid.addSublayer(baseGradient)
-        for (cloud, color) in [(cyanCloud, Palette.cyan), (pinkCloud, Palette.pink)] {
+        for (cloud, color) in [(goldCloud, Palette.gold), (orangeCloud, Palette.orange)] {
             cloud.type = .radial
             cloud.colors = [color.withAlphaComponent(0.72).cgColor, color.withAlphaComponent(0).cgColor]
             cloud.locations = [0, 1]
@@ -121,8 +135,8 @@ final class SPMotionButton: NSButton, CAAnimationDelegate {
             liquid.addSublayer(cloud)
         }
         borderGradient.type = .conic
-        borderGradient.colors = [Palette.cyan.cgColor, Palette.violet.cgColor, Palette.pink.cgColor,
-                                 Palette.violet.cgColor, Palette.cyan.cgColor]
+        borderGradient.colors = [Palette.gold.cgColor, Palette.amber.cgColor, Palette.orange.cgColor,
+                                 Palette.amber.cgColor, Palette.gold.cgColor]
         borderGradient.locations = [0, 0.25, 0.5, 0.75, 1]
         borderGradient.startPoint = CGPoint(x: 0.5, y: 0.5)
         borderGradient.endPoint = CGPoint(x: 1, y: 0.5)
@@ -133,7 +147,7 @@ final class SPMotionButton: NSButton, CAAnimationDelegate {
         borderHost.mask = borderMask
         layer.addSublayer(borderHost)
         for (index, light) in orbitLights.enumerated() {
-            let color = index == 0 ? Palette.cyan : (index == 1 ? Palette.pink : NSColor.white)
+            let color = index == 0 ? Palette.gold : (index == 1 ? Palette.orange : NSColor.white)
             light.backgroundColor = color.cgColor
             light.cornerRadius = index == 2 ? 0.75 : 1.1
             light.shadowColor = color.cgColor
@@ -145,12 +159,26 @@ final class SPMotionButton: NSButton, CAAnimationDelegate {
         layer.addSublayer(foreground)
         frames.strokeColor = NSColor.white.withAlphaComponent(0.95).cgColor
         frames.fillColor = NSColor.clear.cgColor
-        frames.lineWidth = 1.2
+        frames.lineWidth = 0.9
         frames.lineCap = .round
         frames.lineJoin = .round
         foreground.addSublayer(frames)
-        sparkle.fillColor = NSColor.white.cgColor
-        foreground.addSublayer(sparkle)
+        generatedFrame.lineWidth = 1.05
+        generatedFrame.lineCap = .round
+        generatedFrame.lineJoin = .round
+        foreground.addSublayer(generatedFrame)
+        insertedPlus.fillColor = NSColor.clear.cgColor
+        insertedPlus.lineCap = .round
+        insertedPlus.lineJoin = .round
+        foreground.addSublayer(insertedPlus)
+        fpsBadge.cornerRadius = 3.4
+        fpsBadge.borderWidth = 0.6
+        foreground.addSublayer(fpsBadge)
+        fpsText.alignmentMode = .center
+        fpsText.truncationMode = .none
+        fpsText.font = NSFont.monospacedDigitSystemFont(ofSize: 8.6, weight: .semibold)
+        fpsText.fontSize = 8.6
+        fpsBadge.addSublayer(fpsText)
         foreground.shadowColor = NSColor.black.cgColor
         foreground.shadowOpacity = 0.22
         foreground.shadowRadius = 0.8
@@ -161,7 +189,7 @@ final class SPMotionButton: NSButton, CAAnimationDelegate {
         layer.addSublayer(focusRing)
     }
 
-    // Retained for playback-chrome compatibility; this control is always icon-only.
+    // Retained for playback-chrome compatibility; the frame glyph and FPS badge keep one compact footprint.
     func setCompact(_ compact: Bool) { }
     func configure(_ presentation: MotionPresentation, interactionEnabled: Bool) {
         let nextSelected = presentation.visualState == .on
@@ -177,9 +205,33 @@ final class SPMotionButton: NSButton, CAAnimationDelegate {
         selected = nextSelected
         if isEnabled != nextEnabled { isEnabled = nextEnabled }
         state = selected ? .on : .off
-        setAccessibilityValue(presentation.accessibilityValue)
-        var tip = "Motion+ · " + presentation.toolTip
-        if let fps = presentation.fpsReadout { tip += " · " + fps + " fps" }
+        let measuredFPS = Self.validFPS(presentation.outputFPS)
+        let sourceFPS = Self.validFPS(presentation.sourceFPS)
+        // Use the measured presentation cadence when available, otherwise the
+        // source rate already identified in the localized tooltip. Never invent
+        // a target/doubled rate, or render non-finite values into the tiny badge.
+        let readout = measuredFPS ?? sourceFPS
+        fpsReadout = readout.map { $0 >= 1 ? String(format: "%.0f", $0) : "<1" } ?? "—"
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        fpsText.string = fpsReadout
+        CATransaction.commit()
+        let rateValue = readout.map { String(format: "%.3g fps", $0) }
+        setAccessibilityValue(presentation.accessibilityValue + (rateValue.map { " · " + $0 } ?? ""))
+        let safeTipPresentation = MotionPresentation(hasMedia: presentation.hasMedia,
+            requested: presentation.requested, available: presentation.isAvailable,
+            active: presentation.isActive, contentBypassed: presentation.contentBypassed,
+            outputFPS: measuredFPS ?? 0, sourceFPS: sourceFPS ?? 0,
+            coverage: presentation.coverage, status: presentation.status,
+            unavailabilityDescription: presentation.unavailabilityDescription)
+        var tip = "Motion+ · " + safeTipPresentation.toolTip
+        if let measuredFPS {
+            if let sourceFPS {
+                tip += String(format: " · %.3g → %.3g fps", sourceFPS, measuredFPS)
+            } else {
+                tip += String(format: " · %.3g fps", measuredFPS)
+            }
+        }
         if tip != lastToolTip {
             lastToolTip = tip
             toolTip = tip
@@ -191,6 +243,9 @@ final class SPMotionButton: NSButton, CAAnimationDelegate {
             layoutSubtreeIfNeeded()
             startAnimations()
         }
+    }
+    private static func validFPS(_ value: Double) -> Double? {
+        value.isFinite && value > 0 && value <= 999 ? value : nil
     }
     func setEffectsVisible(_ visible: Bool) {
         guard visible != effectsVisible else { return }
@@ -212,6 +267,16 @@ final class SPMotionButton: NSButton, CAAnimationDelegate {
             light.isHidden = !animationRunning || !selected || !isEnabled
             light.opacity = 0
         }
+        generatedFrame.strokeColor = (selected ? Palette.amber : NSColor.white.withAlphaComponent(0.82)).cgColor
+        generatedFrame.fillColor = NSColor.black.withAlphaComponent(selected ? 0.42 : 0.08).cgColor
+        insertedPlus.strokeColor = (selected ? Palette.amber : NSColor.white.withAlphaComponent(0.9)).cgColor
+        fpsBadge.backgroundColor = (selected
+            ? NSColor.black.withAlphaComponent(highlighted ? 0.50 : 0.36)
+            : NSColor.white.withAlphaComponent(highlighted ? 0.14 : 0.065)).cgColor
+        fpsBadge.borderColor = (selected
+            ? Palette.amber.withAlphaComponent(highlighted ? 0.85 : 0.5)
+            : NSColor.white.withAlphaComponent(highlighted ? 0.28 : 0.12)).cgColor
+        fpsText.foregroundColor = (selected && !highlighted ? Palette.amber : NSColor.white).cgColor
         foreground.opacity = isEnabled ? 1 : 0.42
         surface.opacity = isEnabled ? 1 : 0.48
         borderHost.opacity = isEnabled ? 0.9 : 0.3
@@ -239,8 +304,8 @@ final class SPMotionButton: NSButton, CAAnimationDelegate {
         liquid.cornerRadius = radius
         baseGradient.frame = liquid.bounds
         let cloudSize = CGSize(width: max(48, body.width * 0.85), height: 64)
-        cyanCloud.frame = CGRect(origin: CGPoint(x: -cloudSize.width * 0.16, y: -18), size: cloudSize)
-        pinkCloud.frame = CGRect(origin: CGPoint(x: body.width - cloudSize.width * 0.82, y: -15), size: cloudSize)
+        goldCloud.frame = CGRect(origin: CGPoint(x: -cloudSize.width * 0.16, y: -18), size: cloudSize)
+        orangeCloud.frame = CGRect(origin: CGPoint(x: body.width - cloudSize.width * 0.82, y: -15), size: cloudSize)
         halo.frame = bounds
         let bodyPath = CGPath(roundedRect: body.insetBy(dx: -0.5, dy: -0.5), cornerWidth: radius + 0.5,
                               cornerHeight: radius + 0.5, transform: nil)
@@ -253,23 +318,56 @@ final class SPMotionButton: NSButton, CAAnimationDelegate {
         let side = max(60, body.width * 2)
         borderGradient.frame = CGRect(x: (body.width - side) / 2, y: (body.height - side) / 2, width: side, height: side)
         foreground.frame = bounds
-        let glyphX = (bounds.width - 22) / 2
-        let glyphY = (bounds.height - 20) / 2
-        frames.frame = CGRect(x: glyphX, y: glyphY, width: 22, height: 20)
+        // Selected concept: a horizontal perforated filmstrip, with two
+        // original landscape cells around an inserted middle cell carrying +.
+        // Separate cells and rails distinguish generation from PiP windows.
+        let glyphWidth = min(24, max(16, body.width - 6))
+        let glyphHeight: CGFloat = 10.8
+        frames.frame = CGRect(x: bounds.midX - glyphWidth / 2, y: body.maxY - 13.2,
+                              width: glyphWidth, height: glyphHeight)
+        let frameWidth = (glyphWidth - 4.4) / 3
+        let frameStep = frameWidth + 1.6
+        let frameHeight = min(4.3, frameWidth / 1.5)
+        let cellY = (glyphHeight - frameHeight) / 2
         let framesPath = CGMutablePath()
-        framesPath.addRoundedRect(in: CGRect(x: 0.7, y: 6.5, width: 12, height: 9.5), cornerWidth: 1.7, cornerHeight: 1.7)
-        framesPath.addRoundedRect(in: CGRect(x: 5.5, y: 2, width: 12.5, height: 9.5), cornerWidth: 1.7, cornerHeight: 1.7)
+        for y: CGFloat in [0.45, glyphHeight - 0.45] {
+            framesPath.move(to: CGPoint(x: 0.55, y: y))
+            framesPath.addLine(to: CGPoint(x: glyphWidth - 0.55, y: y))
+        }
+        for y: CGFloat in [1.95, glyphHeight - 1.95] {
+            for index in 0..<6 {
+                let x = 1.3 + CGFloat(index) * (glyphWidth - 2.6) / 5
+                framesPath.move(to: CGPoint(x: x - 0.3, y: y))
+                framesPath.addLine(to: CGPoint(x: x + 0.3, y: y))
+            }
+        }
+        for x in [CGFloat(0.6), 0.6 + 2 * frameStep] {
+            framesPath.addRoundedRect(in: CGRect(x: x, y: cellY, width: frameWidth, height: frameHeight),
+                                      cornerWidth: 0.8, cornerHeight: 0.8)
+        }
         frames.path = framesPath
-        sparkle.frame = frames.frame
-        let star = CGMutablePath()
-        let center = CGPoint(x: 18.2, y: 16)
-        star.move(to: CGPoint(x: center.x, y: center.y + 4))
-        star.addQuadCurve(to: CGPoint(x: center.x + 3.4, y: center.y), control: CGPoint(x: center.x + 0.8, y: center.y + 0.7))
-        star.addQuadCurve(to: CGPoint(x: center.x, y: center.y - 4), control: CGPoint(x: center.x + 0.8, y: center.y - 0.7))
-        star.addQuadCurve(to: CGPoint(x: center.x - 3.4, y: center.y), control: CGPoint(x: center.x - 0.8, y: center.y - 0.7))
-        star.addQuadCurve(to: CGPoint(x: center.x, y: center.y + 4), control: CGPoint(x: center.x - 0.8, y: center.y + 0.7))
-        star.closeSubpath()
-        sparkle.path = star
+        generatedFrame.frame = frames.frame
+        let insertedRect = CGRect(x: 0.6 + frameStep, y: cellY, width: frameWidth, height: frameHeight)
+        generatedFrame.path = CGPath(roundedRect: insertedRect, cornerWidth: 0.8,
+                                     cornerHeight: 0.8, transform: nil)
+        insertedPlus.frame = frames.frame
+        let arm = min(frameHeight * 0.28, frameWidth * 0.23)
+        let plus = CGMutablePath()
+        plus.move(to: CGPoint(x: insertedRect.midX - arm, y: insertedRect.midY))
+        plus.addLine(to: CGPoint(x: insertedRect.midX + arm, y: insertedRect.midY))
+        plus.move(to: CGPoint(x: insertedRect.midX, y: insertedRect.midY - arm))
+        plus.addLine(to: CGPoint(x: insertedRect.midX, y: insertedRect.midY + arm))
+        insertedPlus.path = plus
+        insertedPlus.lineWidth = body.width < 28 ? 0.7 : 0.9
+        let badgeWidth = min(25, max(20, body.width - 5))
+        fpsBadge.frame = CGRect(x: bounds.midX - badgeWidth / 2, y: body.minY + 2.4,
+                               width: badgeWidth, height: 10.8)
+        fpsText.bounds = CGRect(x: 0, y: 0, width: badgeWidth, height: 10.8)
+        fpsText.position = CGPoint(x: badgeWidth / 2, y: 5.25)
+        fpsText.setAffineTransform(.identity)
+        let fontSize: CGFloat = body.width < 28 ? 8 : 8.6
+        fpsText.font = NSFont.monospacedDigitSystemFont(ofSize: fontSize, weight: .semibold)
+        fpsText.fontSize = fontSize
         for (index, light) in orbitLights.enumerated() {
             let diameter: CGFloat = index == 2 ? 1.5 : 2.2
             light.bounds = CGRect(x: 0, y: 0, width: diameter, height: diameter)
@@ -288,7 +386,7 @@ final class SPMotionButton: NSButton, CAAnimationDelegate {
     }
     private func updateContentsScale() {
         let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
-        for drawing in [frames, sparkle, borderMask, halo, focusRing] { drawing.contentsScale = scale }
+        for drawing in [frames, generatedFrame, insertedPlus, fpsText, borderMask, halo, focusRing] { drawing.contentsScale = scale }
     }
     override func viewDidChangeBackingProperties() {
         super.viewDidChangeBackingProperties()
@@ -336,7 +434,7 @@ final class SPMotionButton: NSButton, CAAnimationDelegate {
         rotation.delegate = self
         rotation.setValue(introGeneration, forKey: "motionIntroGeneration")
         borderGradient.add(rotation, forKey: "motion.border.intro")
-        for (index, cloud) in [cyanCloud, pinkCloud].enumerated() {
+        for (index, cloud) in [goldCloud, orangeCloud].enumerated() {
             let origin = cloud.position
             let direction: CGFloat = index == 0 ? 1 : -1
             let drift = CAKeyframeAnimation(keyPath: "position")
@@ -380,7 +478,7 @@ final class SPMotionButton: NSButton, CAAnimationDelegate {
         guard animationRunning else { return }
         animationRunning = false
         introGeneration &+= 1
-        for animated in [borderGradient, cyanCloud, pinkCloud, halo] + orbitLights { animated.removeAllAnimations() }
+        for animated in [borderGradient, goldCloud, orangeCloud, halo] + orbitLights { animated.removeAllAnimations() }
         updateAppearance()
     }
 

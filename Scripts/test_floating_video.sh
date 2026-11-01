@@ -7,6 +7,7 @@ trap 'rm -rf "$CHECK_DIR"' EXIT
 FLOATING_SOURCE="${PIP_SLIDER_BASELINE_SOURCE:-$ROOT/Apps/Mac/UI/FloatingVideoController.swift}"
 xcrun swiftc -swift-version 6 -parse-as-library \
   "$ROOT/Apps/Mac/UI/Localization.swift" \
+  "$ROOT/Apps/Mac/UI/VolumeIcon.swift" \
   "$FLOATING_SOURCE" \
   "$ROOT/Scripts/tests/floating_video.swift" \
   -o "$CHECK_DIR/floating-video-checks"

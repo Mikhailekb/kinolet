@@ -110,12 +110,12 @@ struct SPDamageBand {
         }
         return sum / Double(count)
     }
-    static func blueSeparation(_ image: NSBitmapImageRep, from: Double, until: Double) -> Double {
+    static func orangeSeparation(_ image: NSBitmapImageRep, from: Double, until: Double) -> Double {
         var sum = 0.0, count = 0
         for x in Int(from * Double(image.pixelsWide))..<Int(until * Double(image.pixelsWide)) {
             for y in (image.pixelsHigh / 2 - 3)..<(image.pixelsHigh / 2 + 3) {
                 let color = image.colorAt(x: x, y: y)!.usingColorSpace(.deviceRGB)!
-                sum += color.blueComponent - color.redComponent
+                sum += color.redComponent - color.blueComponent
                 count += 1
             }
         }
@@ -154,11 +154,11 @@ struct SPDamageBand {
         }, "Played particles retain brightness and stay neutral white above cache state")
         let baseline = try image(host)
         let light = try image(host, background: 1)
-        expect(blueSeparation(baseline, from: 0.27, until: 0.38) > 0.1 &&
-               abs(blueSeparation(baseline, from: 0.04, until: 0.15)) < 0.01,
-               "Rendered loaded particles are blue while played particles stay white on dark video")
-        expect(blueSeparation(light, from: 0.27, until: 0.38) > 0.03 &&
-               abs(blueSeparation(light, from: 0.04, until: 0.15)) < 0.01,
+        expect(orangeSeparation(baseline, from: 0.27, until: 0.38) > 0.1 &&
+               abs(orangeSeparation(baseline, from: 0.04, until: 0.15)) < 0.01,
+               "Rendered loaded particles are orange while played particles stay white on dark video")
+        expect(orangeSeparation(light, from: 0.27, until: 0.38) > 0.03 &&
+               abs(orangeSeparation(light, from: 0.04, until: 0.15)) < 0.01,
                "Loaded and played states retain separate hues on bright video")
         expect(brightness(baseline, from: 0.27, until: 0.38) > brightness(baseline, from: 0.43, until: 0.5) * 2,
                "Rendered Metal pixels distinguish resident segments from unloaded gaps")
@@ -191,7 +191,7 @@ struct SPDamageBand {
         host.edrAvail = 4
         host.pressed(x: 300); settle(host)
         let hovered = try image(host)
-        expect(blueSeparation(hovered, from: 0.60, until: 0.66) > 0.1,
+        expect(orangeSeparation(hovered, from: 0.60, until: 0.66) > 0.1,
                "Hover and press with HDR headroom cannot wash cached particles into played white")
         host.pointerExited(); host.setSplit(96)
         host.setBufferedRanges([0.2...0.95], visible: false); settle(host)

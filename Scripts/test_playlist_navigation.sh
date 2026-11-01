@@ -72,6 +72,7 @@ if ! xcrun swiftc -swift-version 6 -strict-concurrency=minimal -parse-as-library
  "$ROOT/Apps/Mac/UI/Localization.swift" "$ROOT/Apps/Mac/UI/PlayerUIModel.swift" \
  "$ROOT/Apps/Mac/UI/SPTimeText.swift" "$ROOT/Apps/Mac/UI/SPFeatures.swift" \
  "$ROOT/Apps/Mac/UI/MotionButton.swift" "$ROOT/Apps/Mac/UI/TurboSpeed.swift" \
+ "$ROOT/Apps/Mac/UI/VolumeIcon.swift" \
  "$CHECK_DIR/normalization.swift" "$CHECK_DIR/chrome.swift" "$CHECK_DIR/checks.swift" \
  -o "$CHECK_DIR/checks" > "$CHECK_DIR/build.log" 2>&1; then
  cat "$CHECK_DIR/build.log"

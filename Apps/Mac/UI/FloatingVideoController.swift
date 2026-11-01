@@ -316,8 +316,8 @@ private final class SPFloatingVideoContent: NSView {
         if !volume.isTracking {
             volume.doubleValue = value.volumePercent.isFinite ? min(100, max(0, value.volumePercent)) : 100
         }
-        muteButton.image = NSImage(systemSymbolName: value.muted || volume.doubleValue == 0 ? "speaker.slash" : "speaker.wave.2",
-                                   accessibilityDescription: L("settings.mute"))
+        let iconPercent = volume.isTracking ? volume.doubleValue : value.volumePercent
+        muteButton.image = SPVolumeIcon.image(percent: iconPercent, muted: value.muted, pointSize: 20)
         playPause.image = NSImage(systemSymbolName: value.isPlaying ? "pause.fill" : "play.fill",
                                   accessibilityDescription: L("video.pip.playPause"))?
             .withSymbolConfiguration(.init(pointSize: 34, weight: .regular))
@@ -468,7 +468,7 @@ private final class SPFloatingVideoSliderCell: NSSliderCell {
         if showsBufferedRanges {
             NSGraphicsContext.saveGraphicsState()
             NSBezierPath(roundedRect: track, xRadius: 1.5, yRadius: 1.5).addClip()
-            NSColor.white.withAlphaComponent(0.66).setFill()
+            NSColor(srgbRed: 1, green: 182 / 255, blue: 92 / 255, alpha: 1).setFill()
             for range in bufferedRanges {
                 NSRect(x: track.minX + track.width * range.lowerBound, y: track.minY,
                        width: track.width * (range.upperBound - range.lowerBound), height: track.height).fill()

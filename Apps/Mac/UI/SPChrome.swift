@@ -2494,7 +2494,7 @@ final class SPProgressView: NSView {
         remainLayer.fillColor = SPT.trackRemain.cgColor
         fillLayer.fillColor = NSColor.white.cgColor
         bufferedBaseLayer.fillColor = NSColor(white: 0.18, alpha: 1).cgColor
-        bufferedLayer.fillColor = NSColor(white: 0.64, alpha: 1).cgColor
+        bufferedLayer.fillColor = SPT.turboAccentColor.cgColor
         bufferedPlayedLayer.fillColor = NSColor.white.cgColor
         bufferedMask.fillColor = NSColor.white.cgColor
         bufferedLayer.mask = bufferedMask
@@ -4057,11 +4057,6 @@ final class SPChromeView: NSView, PlayerChromePresenting {
         let presentation = turboFrozenMotion ?? motionPresentation
         let enabled = presentation.isControlEnabled && !turboLocked
         motionBtn.configure(presentation, interactionEnabled: enabled)
-        var tip = "Motion+ · " + presentation.toolTip
-        if let fps = presentation.fpsReadout { tip += " · " + fps + " fps" }
-        motionBtn.toolTip = tip
-        motionBtn.setAccessibilityValue(presentation.accessibilityValue)
-        motionBtn.setAccessibilityHelp(tip)
     }
 
     func setXDR(_ presentation: XDRPresentation) {
@@ -4218,9 +4213,9 @@ final class SPChromeView: NSView, PlayerChromePresenting {
 
     private func renderLatestVolume(animated: Bool) {
         volSlider.setValue(latestVolumePct, animated: animated)
-        muteBtn.setSymbol(latestMuted || latestVolumePct == 0
-                              ? "speaker.slash.fill" : "speaker.wave.2.fill",
-                          pointSize: SPM.symAux)
+        let icon = SPVolumeIcon.image(percent: latestVolumePct, muted: latestMuted,
+                                      pointSize: SPM.symAux)
+        if muteBtn.image !== icon { muteBtn.image = icon }
     }
 
     private static func fmt(_ t: Double) -> String { SPTimeText.clock(t) }

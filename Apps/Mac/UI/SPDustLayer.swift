@@ -406,6 +406,10 @@ private final class SPDustLinkProxy: NSObject {
 // MARK: - Layer host and event-driven animation
 @MainActor
 final class SPDustHost: NSObject {
+    // Same encoded sRGB #FFB65C as SPT.turboAccentColor. The particle layer
+    // renders in extended-linear sRGB, so convert once rather than per grain.
+    private static let cachedAccent = SPDustModel.srgbToLinear(SIMD3<Float>(1, 182.0 / 255, 92.0 / 255))
+
     /// Non-store builds may override the selected timeline style for diagnostics.
     static var enabled: Bool {
 #if SP_APP_STORE
@@ -909,12 +913,12 @@ final class SPDustHost: NSObject {
             }
             if showsBufferedRanges {
                 // Cache states have stable colors independent of thumbnail
-                // hues: watched is white, resident ahead is cool blue.
+                // hues: watched is white, resident ahead is warm orange.
                 col = SIMD3(repeating: 1)
                 if cacheAhead {
                     if cached {
-                        col = SIMD3(0.035, 0.42, 1)
-                        // Cap EDR brightness so blue never clips to white.
+                        col = Self.cachedAccent
+                        // Cap EDR brightness so orange never clips to white.
                         L = min(0.68, max(L, (isRail ? 0.58 : 0.30) * bn))
                     } else {
                         L *= 0.24
