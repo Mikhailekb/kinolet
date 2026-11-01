@@ -247,6 +247,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     private var torrentOpenCandidate: SPTorrentPlaybackContext?
     private var torrentOpenTask: Task<Void, Never>?
     private var torrentStatusTask: Task<Void, Never>?
+    private let torrentDownloadChooser = SPTorrentDownloadChooser()
     private lazy var torrentFileSaves: SPTorrentFileSaves = {
         let saves = SPTorrentFileSaves()
         saves.onChange = { [weak self] in self?.refreshPlaylistView() }
@@ -4068,14 +4069,49 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         NSWorkspace.shared.activateFileViewerSelecting([snapshot.destination])
     }
 
-    /// The panel names the requested playlist file. Its callback must still
-    /// match the visible torrent, but changing the playing episode is harmless.
-    /// Started saves own independent leases and survive subsequent navigation.
+    /// Both the playlist row and the current-file action choose a downloader.
+    /// A pending application picker must not hand off a different torrent.
     private func presentTorrentFileSave(_ file: SPTorrentFile, descriptor: SPTorrentDescriptor) {
-        guard torrentCacheRestartToken == nil, hasMediaSession,
+        guard torrentCacheRestartToken == nil, !torrentResolving, hasMediaSession,
               torrentFileSaves.snapshot(descriptor: descriptor, file: file)?.isActive != true,
               let window = view.window, window.attachedSheet == nil else { return }
         let token = UUID()
+        let openGeneration = torrentOpenGeneration
+        torrentSavePanelToken = token
+        let isCurrent: @MainActor () -> Bool = { [weak self, weak window] in
+            guard let self, let window, self.view.window === window, self.hasMediaSession,
+                  self.torrentSavePanelToken == token, self.torrentCacheRestartToken == nil,
+                  !self.torrentResolving, self.torrentOpenGeneration == openGeneration,
+                  let current = self.torrentContext,
+                  current.descriptor.hash == descriptor.hash,
+                  current.descriptor.files.contains(file),
+                  self.torrentFileSaves.snapshot(descriptor: current.descriptor, file: file)?.isActive != true else {
+                return false
+            }
+            return true
+        }
+        torrentDownloadChooser.present(descriptor: descriptor, file: file, in: view,
+            isCurrent: isCurrent,
+            builtIn: { [weak self] in
+                guard isCurrent() else { return }
+                self?.presentBuiltInTorrentFileSave(file, descriptor: descriptor)
+            },
+            failed: { [weak self] error in
+                guard isCurrent() else { return }
+                self?.presentNonBlockingAlert(message: L("torrent.downloadExternalFailed"),
+                    informative: error.localizedDescription)
+            })
+    }
+
+    /// The panel names the requested playlist file. Its callback must still
+    /// match the visible torrent, but changing the playing episode is harmless.
+    /// Started saves own independent leases and survive subsequent navigation.
+    private func presentBuiltInTorrentFileSave(_ file: SPTorrentFile, descriptor: SPTorrentDescriptor) {
+        guard torrentCacheRestartToken == nil, !torrentResolving, hasMediaSession,
+              torrentFileSaves.snapshot(descriptor: descriptor, file: file)?.isActive != true,
+              let window = view.window, window.attachedSheet == nil else { return }
+        let token = UUID()
+        let openGeneration = torrentOpenGeneration
         torrentSavePanelToken = token
         let panel = NSSavePanel()
         panel.title = L("torrent.saveFile")
@@ -4084,6 +4120,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             guard response == .OK, let destination = panel.url, let self, let window,
                   self.view.window === window, self.hasMediaSession,
                   self.torrentSavePanelToken == token, self.torrentCacheRestartToken == nil,
+                  !self.torrentResolving, self.torrentOpenGeneration == openGeneration,
                   let current = self.torrentContext,
                   current.descriptor.hash == descriptor.hash,
                   current.descriptor.files.contains(file) else { return }

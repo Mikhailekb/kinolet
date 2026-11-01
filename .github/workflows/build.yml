@@ -137,6 +137,8 @@ jobs:
           run_check ./Scripts/test_playlist_navigation.sh
           run_check ./Scripts/test_playlist_file_download_rows.sh
           run_check ./Scripts/test_torrent_file_saves.sh
+          run_check ./Scripts/test_torrent_download_chooser.sh
+          run_check ./Scripts/test_torrent_download_routing.sh
           run_check ./Scripts/test_torrent_buffer_metrics.sh
           run_check ./Scripts/test_torrent_models.sh
           run_check ./Scripts/test_torrent_playback.sh
