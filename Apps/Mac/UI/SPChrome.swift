@@ -101,6 +101,14 @@ final class SPIconButton: NSButton {
     var onHoverChanged: ((NSButton, Bool) -> Void)?
     var onFocusChanged: ((Bool) -> Void)?
     var preservesKeyboardFocusOnClick = false
+    var preservesEnabledAppearance = false {
+        didSet {
+            // Drawing stays normal during a temporary input lock; the native
+            // disabled state still blocks pointer, keyboard and AX activation.
+            (cell as? NSButtonCell)?.imageDimsWhenDisabled = !preservesEnabledAppearance
+            needsDisplay = true
+        }
+    }
 
     init(symbol: String, pointSize: CGFloat, size: CGFloat) {
         super.init(frame: NSRect(x: 0, y: 0, width: size, height: size))
@@ -3867,7 +3875,7 @@ final class SPChromeView: NSView, PlayerChromePresenting {
         volumeGroup.layoutSubtreeIfNeeded()
         let timeX = volumeFrame.maxX + 8
         let timeBudget = max(0, rx - 8 - timeX)
-        let showRate = abs(currentRate - 1) > 0.0001
+        let showRate = !latestTurbo && abs(currentRate - 1) > 0.0001
             && timeBudget >= timeLabel.preferredWidth + regularRateWidth + actionGap
         rateChip.isHidden = !showRate
         rateChip.frame = NSRect(x: rx - regularRateWidth, y: byC - SPM.btnAux / 2,
@@ -4056,7 +4064,8 @@ final class SPChromeView: NSView, PlayerChromePresenting {
         guard SPFeatures.enhancements else { return }
         let presentation = turboFrozenMotion ?? motionPresentation
         let enabled = presentation.isControlEnabled && !turboLocked
-        motionBtn.configure(presentation, interactionEnabled: enabled)
+        motionBtn.configure(presentation, interactionEnabled: enabled,
+                            preserveEnabledAppearance: turboLocked)
     }
 
     func setXDR(_ presentation: XDRPresentation) {
@@ -4170,7 +4179,7 @@ final class SPChromeView: NSView, PlayerChromePresenting {
         turboLocked = locked
         for b in [rateChip] as [NSButton] {
             b.isEnabled = !locked
-            b.alphaValue = locked ? 0.4 : 1
+            b.alphaValue = 1
         }
         track.interactionLocked = locked
         updatePlaylistNavigationButtons()
@@ -4252,8 +4261,10 @@ final class SPChromeView: NSView, PlayerChromePresenting {
         nextBtn.isHidden = !playlistNavigation.isVisible
         previousBtn.isEnabled = playlistNavigation.canPrevious && !turboLocked
         nextBtn.isEnabled = playlistNavigation.canNext && !turboLocked
-        previousBtn.alphaValue = previousBtn.isEnabled ? 1 : 0.35
-        nextBtn.alphaValue = nextBtn.isEnabled ? 1 : 0.35
+        previousBtn.preservesEnabledAppearance = turboLocked && playlistNavigation.canPrevious
+        nextBtn.preservesEnabledAppearance = turboLocked && playlistNavigation.canNext
+        previousBtn.alphaValue = playlistNavigation.canPrevious ? 1 : 0.35
+        nextBtn.alphaValue = playlistNavigation.canNext ? 1 : 0.35
     }
 
     func setPictureInPictureSelected(_ selected: Bool) {

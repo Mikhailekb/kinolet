@@ -59,6 +59,15 @@ struct MotionButtonChecks {
         expect(amber.redComponent > 0.95 && amber.greenComponent > 0.65 && amber.blueComponent < 0.45, "Enabled FPS badge uses the established warm orange")
         expect(button.isEnabled && button.state == .on, "Measured readouts preserve the requested On state")
         expect(descendants(button.layer!).allSatisfy { ($0.animationKeys() ?? []).isEmpty }, "Detached controls do not animate behind hidden chrome")
+        let surface = named(button, "sp.motion.surface", as: CALayer.self)
+        let activeOpacity = surface.opacity
+        button.configure(model(), interactionEnabled: false, preserveEnabledAppearance: true)
+        expect(!button.isEnabled && surface.opacity == activeOpacity && button.state == .on,
+               "A temporary Turbo lock blocks input without dimming the active control")
+        button.configure(model(available: false), interactionEnabled: false, preserveEnabledAppearance: true)
+        expect(!button.isEnabled && surface.opacity < activeOpacity,
+               "A real media capability restriction still looks unavailable")
+        configure(button, model())
         let event = NSEvent.enterExitEvent(with: .mouseEntered, location: .zero, modifierFlags: [],
             timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: 0, context: nil,
             eventNumber: 0, trackingNumber: 0, userData: nil)!

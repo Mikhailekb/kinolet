@@ -40,8 +40,17 @@ enum SPPlayerCore { static func fullFeatureTier() -> Bool { ProcessInfo.processI
         }
         return count
     }
+    static func buttonPixels(_ button: NSButton) -> Data {
+        button.layoutSubtreeIfNeeded()
+        button.displayIfNeeded()
+        guard let rep = button.bitmapImageRepForCachingDisplay(in: button.bounds) else { fatalError("No button bitmap") }
+        button.cacheDisplay(in: button.bounds, to: rep)
+        return Data(bytes: rep.bitmapData!, count: rep.bytesPerRow * rep.pixelsHigh)
+    }
     static func main() throws {
         NSApplication.shared.setActivationPolicy(.prohibited)
+        let artifactDirectory = CommandLine.arguments.count == 2 ? URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true) : nil
+        if let artifactDirectory { try FileManager.default.createDirectory(at: artifactDirectory, withIntermediateDirectories: true) }
         let chrome = SPChromeView()
         chrome.appearance = NSAppearance(named: .darkAqua)
         chrome.setTime(position: 614, duration: 3231, rate: 1)
@@ -78,11 +87,64 @@ enum SPPlayerCore { static func fullFeatureTier() -> Bool { ProcessInfo.processI
         check(!chrome.previousBtn.refusesFirstResponder && !chrome.nextBtn.refusesFirstResponder &&
               chrome.previousBtn.preservesKeyboardFocusOnClick && chrome.nextBtn.preservesKeyboardFocusOnClick,
               "navigation remains keyboard accessible without stealing mouse-click focus")
+        chrome.setTime(position: 614, duration: 3231, rate: 2)
+        chrome.layoutRightControls()
+        check(!chrome.rateChip.isHidden, "An ordinary fixed 2x rate still has its bottom control")
+        let previousPixels = buttonPixels(chrome.previousBtn)
+        let nextPixels = buttonPixels(chrome.nextBtn)
+        let ratePixels = buttonPixels(chrome.rateChip)
+        check(ratePixels.contains { $0 != 0 }, "Visible rate comparison uses actual rendered title pixels")
+        if let artifactDirectory {
+            try capture(chrome.nextBtn, to: artifactDirectory.appendingPathComponent("next-enabled-\(SPFeatures.enhancements ? "full" : "basic").png"))
+            try capture(chrome.rateChip, to: artifactDirectory.appendingPathComponent("rate-enabled-\(SPFeatures.enhancements ? "full" : "basic").png"))
+        }
         chrome.setTurboPhase(.charging)
         check(!chrome.previousBtn.isEnabled && !chrome.nextBtn.isEnabled, "Turbo charge disables navigation")
+        check(chrome.previousBtn.alphaValue == 1 && chrome.nextBtn.alphaValue == 1 && chrome.rateChip.alphaValue == 1,
+              "Turbo lock preserves the alpha of controls that were available")
+        check(buttonPixels(chrome.previousBtn) == previousPixels && buttonPixels(chrome.nextBtn) == nextPixels,
+              "Native disabled icon cells keep their exact enabled pixels during Turbo")
+        check(buttonPixels(chrome.rateChip) == ratePixels && !chrome.rateChip.isEnabled,
+              "The disabled rate chip retains its original native title rendering")
+        if let artifactDirectory {
+            try capture(chrome.nextBtn, to: artifactDirectory.appendingPathComponent("next-turbo-locked-\(SPFeatures.enhancements ? "full" : "basic").png"))
+            try capture(chrome.rateChip, to: artifactDirectory.appendingPathComponent("rate-turbo-locked-\(SPFeatures.enhancements ? "full" : "basic").png"))
+        }
+        chrome.previousBtn.performClick(nil); chrome.nextBtn.performClick(nil)
+        check(previousCalls == 1 && nextCalls == 2, "Native clicks stay blocked despite the normal icon appearance")
+        check(!chrome.nextBtn.accessibilityPerformPress() && nextCalls == 2,
+              "Accessibility press cannot activate Turbo-locked navigation")
+        chrome.nextBtn.keyEquivalent = "n"
+        let key = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
+            windowNumber: 0, context: nil, characters: "n", charactersIgnoringModifiers: "n", isARepeat: false, keyCode: 45)!
+        check(!chrome.nextBtn.performKeyEquivalent(with: key) && nextCalls == 2,
+              "Keyboard activation respects the actual disabled state")
+        chrome.nextBtn.keyEquivalent = ""
+        chrome.setTurboPhase(.active)
+        check(chrome.rateChip.isHidden, "Active temporary Turbo removes the duplicate bottom rate indicator")
+        check(buttonPixels(chrome.previousBtn) == previousPixels && buttonPixels(chrome.nextBtn) == nextPixels,
+              "Active Turbo also retains normal navigation pixels")
         chrome.setTurboPhase(.idle)
+        check(!chrome.rateChip.isHidden, "Releasing Turbo restores the ordinary fixed-rate control")
         check(chrome.previousBtn.isEnabled && chrome.nextBtn.isEnabled, "releasing Turbo restores current navigation state")
+        check(!chrome.previousBtn.preservesEnabledAppearance && !chrome.nextBtn.preservesEnabledAppearance,
+              "Releasing Turbo removes the render-only enabled override")
         chrome.setPlaylistNavigation(.init(hasMedia: true, count: 3, currentIndex: 2))
+        let unavailablePixels = buttonPixels(chrome.nextBtn)
+        chrome.setTurboPhase(.charging)
+        check(chrome.nextBtn.alphaValue == 0.35 && !chrome.nextBtn.preservesEnabledAppearance &&
+              buttonPixels(chrome.nextBtn) == unavailablePixels,
+              "A real playlist boundary stays dim and unavailable during Turbo")
+        chrome.setTurboPhase(.idle)
+        chrome.isHidden = true
+        chrome.setTurboPhase(.active)
+        chrome.show()
+        check(chrome.rateChip.isHidden, "Showing hidden chrome replays active Turbo without a bottom rate indicator")
+        chrome.isHidden = true
+        chrome.setTurboPhase(.idle)
+        chrome.show()
+        check(!chrome.rateChip.isHidden, "Showing chrome after hidden Turbo release restores the fixed-rate control")
+        chrome.setTime(position: 614, duration: 3231, rate: 1)
         chrome.nextBtn.performClick(nil)
         check(chrome.previousBtn.isEnabled && !chrome.nextBtn.isEnabled && nextCalls == 2,
               "last item disables Next without wrapping")
@@ -91,8 +153,6 @@ enum SPPlayerCore { static func fullFeatureTier() -> Bool { ProcessInfo.processI
               "opening keeps playlist positions but disables switching")
         chrome.setPlaylistNavigation(.none)
         check(chrome.volumeGroup.frame.minX == standaloneX, "leaving playlist removes all navigation spacing")
-        let artifactDirectory = CommandLine.arguments.count == 2 ? URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true) : nil
-        if let artifactDirectory { try FileManager.default.createDirectory(at: artifactDirectory, withIntermediateDirectories: true) }
         for width: CGFloat in [480,500,540,640,1280] {
             chrome.setPlaylistNavigation(.init(hasMedia: true, count: 3, currentIndex: 1))
             chrome.layoutChrome(in: NSRect(x: 0, y: 0, width: width, height: 720))

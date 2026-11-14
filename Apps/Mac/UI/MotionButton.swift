@@ -40,6 +40,7 @@ final class SPMotionButton: NSButton, CAAnimationDelegate {
     private var fpsReadout = "—"
     private let orbitLights = [CALayer(), CALayer(), CALayer()]
     private var selected = false
+    private var appearanceEnabled = false
     private var effectsVisible = false
     private var hovering = false
     private var keyboardFocused = false
@@ -185,9 +186,11 @@ final class SPMotionButton: NSButton, CAAnimationDelegate {
 
     // Retained for playback-chrome compatibility; the frame glyph and FPS badge keep one compact footprint.
     func setCompact(_ compact: Bool) { }
-    func configure(_ presentation: MotionPresentation, interactionEnabled: Bool) {
+    func configure(_ presentation: MotionPresentation, interactionEnabled: Bool,
+                   preserveEnabledAppearance: Bool = false) {
         let nextSelected = presentation.visualState == .on
         let nextEnabled = presentation.isControlEnabled && interactionEnabled
+        let nextAppearanceEnabled = presentation.isControlEnabled && (interactionEnabled || preserveEnabledAppearance)
         // Consume every request transition, including those made while hidden or
         // suspended. Restoring media, bypass recovery and Turbo unlock are static.
         let switchedOn = previousHadMedia && presentation.hasMedia
@@ -195,8 +198,10 @@ final class SPMotionButton: NSButton, CAAnimationDelegate {
         previousRequested = presentation.requested
         previousHadMedia = presentation.hasMedia
         previousInteractionEligible = nextEnabled
-        let appearanceChanged = selected != nextSelected || isEnabled != nextEnabled
+        let appearanceChanged = selected != nextSelected || isEnabled != nextEnabled ||
+            appearanceEnabled != nextAppearanceEnabled
         selected = nextSelected
+        appearanceEnabled = nextAppearanceEnabled
         if isEnabled != nextEnabled { isEnabled = nextEnabled }
         state = selected ? .on : .off
         let measuredFPS = Self.validFPS(presentation.outputFPS)
@@ -269,9 +274,9 @@ final class SPMotionButton: NSButton, CAAnimationDelegate {
             ? Palette.amber.withAlphaComponent(highlighted ? 0.85 : 0.5)
             : NSColor.white.withAlphaComponent(highlighted ? 0.28 : 0.12)).cgColor
         fpsText.foregroundColor = (selected && !highlighted ? Palette.amber : NSColor.white).cgColor
-        foreground.opacity = isEnabled ? 1 : 0.42
-        surface.opacity = isEnabled ? 1 : 0.48
-        borderHost.opacity = isEnabled ? 0.9 : 0.3
+        foreground.opacity = appearanceEnabled ? 1 : 0.42
+        surface.opacity = appearanceEnabled ? 1 : 0.48
+        borderHost.opacity = appearanceEnabled ? 0.9 : 0.3
         // Intro-only decorations must remain invisible when explicit fades
         // finish, even before their completion callback is delivered.
         halo.opacity = 0
