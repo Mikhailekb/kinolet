@@ -52,6 +52,7 @@ private func fixturePayload() -> [String: Any] {
 @MainActor private final class Controller {
     var torrentContext: SPTorrentPlaybackContext? = SPTorrentPlaybackContext()
     var torrentLastCacheSnapshot: SPTorrentCacheSnapshot?
+    var torrentCacheRefillObservation: UUID? = UUID()
     var torrentTimelinePresentation: SPTorrentTimelinePresentation?
     var core: Core? = Core()
     var hasMediaSession = true
@@ -141,7 +142,8 @@ private func fixturePayload() -> [String: Any] {
         controller.apply(empty, context: current)
         check(controller.chrome!.ranges.isEmpty && controller.chrome!.visible, "Eviction replaces old coverage with an explicit empty rail")
         controller.clear()
-        check(controller.torrentLastCacheSnapshot == nil && !controller.chrome!.visible && !controller.floatingVideo.visible,
+        check(controller.torrentLastCacheSnapshot == nil && controller.torrentCacheRefillObservation == nil &&
+              !controller.chrome!.visible && !controller.floatingVideo.visible,
               "Source close clears old cache state and returns local playback to its original timeline")
 
         controller.core!.sourcePlaybackWaitReason = .pipeline

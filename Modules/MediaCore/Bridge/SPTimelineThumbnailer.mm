@@ -49,6 +49,7 @@ using spthumb::SPThumbTaskKind;
 using spthumb::kImmuneBase;
 
 #include "SPRuntimeGates.hpp"
+#include "../Core/SPCachedTimeline.hpp"
 
 #define SPLOG(fmt, ...) NSLog(@"[c%u]" fmt, self->_spLogId, ##__VA_ARGS__)
 
@@ -61,8 +62,11 @@ struct SPThumbShared {
     bool doviIPT = false;
     ~SPThumbShared() { if (videoPar) avcodec_parameters_free(&videoPar); }
     std::mutex mtx;
+    std::shared_ptr<const spcachetime::SourceMap> sourceTimeMap;
     std::condition_variable cv;
     std::atomic<bool> stop{false};
+    std::atomic<bool> sourceTimeMapAttemptFinished{false};
+    std::atomic<int64_t> sourceTimeMapDeadlineUs{0};
 
     std::atomic<uint64_t> yieldSeq{0};
     std::atomic<int64_t> lastYieldWallUs{0};
@@ -100,6 +104,8 @@ struct SPThumbShared {
 
 static int spThumbInterruptCb(void *opaque) {
     auto *s = (SPThumbShared *)opaque;
+    const int64_t deadline = s->sourceTimeMapDeadlineUs.load();
+    if (deadline > 0 && spNowUs() >= deadline) return 1;
     return spthumb::taskInterrupted(s->stop.load(),
                                     s->http ? s->cbYieldBase.load() : s->yieldSeq.load(), s->cbYieldBase.load(),
                                     s->hoverSeq.load(), s->cbHoverBase.load(),
@@ -576,6 +582,7 @@ static NSData *spThumbFirstPacketHint(const AVCodecParameters *par,
 // Internal configuration, deliberately absent from the public bridge header.
 - (BOOL)configurePersistentCacheDirectory:(NSURL *)directory intervalSeconds:(double)seconds;
 @property (nonatomic, readonly) BOOL persistentPreparationPending;
+- (void)_mainSourceTimeMapPreparationFinished;
 - (void)_mainStoreJPEG:(NSData *)jpeg
               forKeyUs:(int64_t)keyUs
       resolvedTargetUs:(int64_t)resolvedTargetUs
@@ -660,26 +667,36 @@ static void spThumbApplyIOTier(spthumb::SPThumbIOTier tier, bool hoverTask) {
 struct SPThumbHTTPInput {
     std::unique_ptr<sp::HTTPRangeIO> input;
     AVIOContext *io = nullptr;
+    int64_t bytesLeft = -1;
     void reset() {
         if (io) { av_freep(&io->buffer); avio_context_free(&io); }
         input.reset();
+        bytesLeft = -1;
     }
     ~SPThumbHTTPInput() { reset(); }
     int attach(AVFormatContext *context, const std::string &url,
-               std::function<bool()> interrupted, std::function<bool()> admitted) {
+               std::function<bool()> interrupted, std::function<bool()> admitted,
+               int64_t readBudget = -1) {
         reset();
+        bytesLeft = readBudget;
         input = std::make_unique<sp::HTTPRangeIO>(url, std::move(interrupted), 15.0);
+        if (readBudget >= 0) input->setReadBlockSize(32 * 1024);
         input->setReadAdmission(std::move(admitted));
         const int result = input->open();
         if (result < 0) { reset(); return result; }
         constexpr int bytes = 32 * 1024;
         auto *buffer = static_cast<uint8_t *>(av_malloc(bytes));
         if (!buffer) { reset(); return AVERROR(ENOMEM); }
-        io = avio_alloc_context(buffer, bytes, 0, input.get(),
+        io = avio_alloc_context(buffer, bytes, 0, this,
             [](void *opaque, uint8_t *destination, int count) {
-                return static_cast<sp::HTTPRangeIO *>(opaque)->read(destination, count);
+                auto *owner = static_cast<SPThumbHTTPInput *>(opaque);
+                if (owner->bytesLeft == 0) return AVERROR_EXIT;
+                if (owner->bytesLeft > 0) count = (int)std::min<int64_t>(count, owner->bytesLeft);
+                const int result = owner->input->read(destination, count);
+                if (result > 0 && owner->bytesLeft >= 0) owner->bytesLeft -= result;
+                return result;
             }, nullptr, [](void *opaque, int64_t offset, int whence) {
-                return static_cast<sp::HTTPRangeIO *>(opaque)->seek(offset, whence);
+                return static_cast<SPThumbHTTPInput *>(opaque)->input->seek(offset, whence);
             });
         if (!io) { av_free(buffer); reset(); return AVERROR(ENOMEM); }
         io->seekable = AVIO_SEEKABLE_NORMAL;
@@ -768,10 +785,21 @@ static void spThumbWorkerMain(std::shared_ptr<SPThumbShared> sh,
     };
 
     spthumb::SPThumbKeyMap tsKeys;
+    bool sourceMapOnlyOpening = false;
+    auto finishSourceMapAttempt = [&] {
+        if (!sh->http || sh->sourceTimeMapAttemptFinished.exchange(true)) return;
+        __weak SPTimelineThumbnailer *target = weakSelf;
+        spThumbQueuePublication(sh, ^{ [target _mainSourceTimeMapPreparationFinished]; });
+    };
 
     auto ensureOpen = [&](const SPThumbClaim &claim) -> SPThumbOpenResult {
         if (opened) return SPThumbOpenResult::Ready;
         if (openFailed) return SPThumbOpenResult::Failed;
+        sh->sourceTimeMapDeadlineUs.store(sourceMapOnlyOpening ? spNowUs() + 5000000 : 0);
+        struct ClearMapDeadline {
+            SPThumbShared &shared;
+            ~ClearMapDeadline() { shared.sourceTimeMapDeadlineUs.store(0); }
+        } clearMapDeadline{*sh};
         sh->cbYieldBase.store(claim.yieldBase);
         sh->cbHoverBase.store(kImmuneBase);
         sh->cbCancelBase.store(claim.cancelBase);
@@ -791,7 +819,7 @@ static void spThumbWorkerMain(std::shared_ptr<SPThumbShared> sh,
         int ret = 0;
         if (sh->http) {
             ret = httpInput.attach(c, sh->path, [sh] { return spThumbInterruptCb(sh.get()); },
-                [probe] { return !probe || probe(); });
+                [probe] { return !probe || probe(); }, sourceMapOnlyOpening ? 4ll * 1024 * 1024 : -1);
         }
         if (ret >= 0) ret = avformat_open_input(&c, sh->path.c_str(), nullptr, &opts);
         else avformat_free_context(c);
@@ -800,10 +828,15 @@ static void spThumbWorkerMain(std::shared_ptr<SPThumbShared> sh,
             if (sh->http) httpInput.reset();
             if (interrupted() || (sh->http && probe && !probe())) return SPThumbOpenResult::Preempted;
             if (sh->http && (ret == AVERROR(EIO) || ret == AVERROR(ETIMEDOUT))) {
+                if (sourceMapOnlyOpening) {
+                    finishSourceMapAttempt();
+                    return SPThumbOpenResult::Failed;
+                }
                 httpRetryAfterUs = spNowUs() + 3000000;
                 return SPThumbOpenResult::Preempted;
             }
             openFailed = true;
+            finishSourceMapAttempt();
             if (sh->persistentIntervalUs > 0) sh->persistentSweepFinished.store(true);
             if (spDebug()) NSLog(@"[c%u][Thumb] open 失败 ret=%d，本会话停用", sh->logId, ret);
             return SPThumbOpenResult::Failed;
@@ -846,6 +879,7 @@ static void spThumbWorkerMain(std::shared_ptr<SPThumbShared> sh,
                 avformat_close_input(&c);
                 if (sh->http) httpInput.reset();
                 openFailed = true;
+                finishSourceMapAttempt();
                 if (sh->persistentIntervalUs > 0) sh->persistentSweepFinished.store(true);
                 if (spDebug()) NSLog(@"[c%u][Thumb] 影子上下文无主视频流（索引 %d id %d），本会话停用",
                                      sh->logId, want, sh->videoStreamId);
@@ -864,6 +898,7 @@ static void spThumbWorkerMain(std::shared_ptr<SPThumbShared> sh,
             avformat_close_input(&c);
             if (sh->http) httpInput.reset();
             openFailed = true;
+            finishSourceMapAttempt();
             if (sh->persistentIntervalUs > 0) sh->persistentSweepFinished.store(true);
             if (spDebug()) NSLog(@"[c%u][Thumb] 无可用视频流，本会话停用", sh->logId);
             return SPThumbOpenResult::Failed;
@@ -923,13 +958,60 @@ static void spThumbWorkerMain(std::shared_ptr<SPThumbShared> sh,
             keyAbsUs.erase(std::unique(keyAbsUs.begin(), keyAbsUs.end()),
                            keyAbsUs.end());
 
-            if (interrupted()) {
+            if (interrupted() || (sh->http && probe && !probe())) {
                 avformat_close_input(&ctx);
                 if (sh->http) httpInput.reset();
                 ctx = nullptr;
                 vs = -1;
                 keyAbsUs.clear();
                 return SPThumbOpenResult::Preempted;
+            }
+        }
+        if (interrupted() || (sh->http && probe && !probe())) {
+            avformat_close_input(&ctx);
+            if (sh->http) httpInput.reset();
+            ctx = nullptr;
+            vs = -1;
+            return SPThumbOpenResult::Preempted;
+        }
+        if (sourceMapOnlyOpening && (spThumbInterruptCb(sh.get()) || httpInput.bytesLeft == 0)) {
+            // A metadata budget/deadline failure is a completed unknown result,
+            // not permission to publish a partially prepared Cues map.
+            return SPThumbOpenResult::Failed;
+        }
+        // Matroska defers Cues until a real seek. The admitted preview context
+        // has just loaded them independently; share those immutable anchors so
+        // a paused player's cache rail does not wait for its first user seek.
+        // No extra network read or main-context queue/cursor mutation occurs.
+        if (sh->http && matched && indexTrusted && httpInput.input && sh->durationUs > 0 &&
+            sh->videoStreamIndex >= 0 && !interrupted() && (!probe || probe())) {
+            const int64_t sourceSize = httpInput.input->size();
+            const int count = avformat_index_get_entries_count(st);
+            constexpr int maxPoints = 4096;
+            const int step = std::max(1, (count + maxPoints - 1) / maxPoints);
+            std::vector<spcachetime::Point> points;
+            points.reserve(std::min(count, maxPoints) + 1);
+            auto append = [&](int i) {
+                const AVIndexEntry *entry = avformat_index_get_entry(st, i);
+                if (!entry || entry->pos < 0 || entry->timestamp == AV_NOPTS_VALUE) return;
+                const int64_t absolute = av_rescale_q(entry->timestamp, st->time_base, AV_TIME_BASE_Q);
+                if ((sh->originUs > 0 && absolute < INT64_MIN + sh->originUs) ||
+                    (sh->originUs < 0 && absolute > INT64_MAX + sh->originUs)) return;
+                points.push_back({entry->pos, absolute - sh->originUs});
+            };
+            for (int i = 0; i < count; i += step) append(i);
+            if (count > 0 && (count - 1) % step != 0) append(count - 1);
+            auto spans = spcachetime::indexSpans(std::move(points), sourceSize, sh->durationUs);
+            if (sourceSize > 0 && !spans.empty()) {
+                auto map = std::make_shared<spcachetime::SourceMap>();
+                map->sourceSize = sourceSize;
+                map->durationUs = sh->durationUs;
+                map->streams.push_back({sh->videoStreamIndex, std::move(spans)});
+                std::lock_guard<std::mutex> lock(sh->mtx);
+                // Retiring a preview HTTP context keeps its already-verified
+                // keyframe plan. A reopen may expose only a sparse prefix;
+                // never replace this source's first immutable map with that.
+                if (!sh->stop.load() && !sh->sourceTimeMap) sh->sourceTimeMap = std::move(map);
             }
         }
         if (sp::doviHEVCDualLayerSupported(st->codecpar))
@@ -981,6 +1063,7 @@ static void spThumbWorkerMain(std::shared_ptr<SPThumbShared> sh,
         }
         planBuilt = true;
         opened = true;
+        finishSourceMapAttempt();
 
         {
             NSMutableData *keys = [NSMutableData data];
@@ -1490,7 +1573,8 @@ static void spThumbWorkerMain(std::shared_ptr<SPThumbShared> sh,
                 }
 
                 return sh->sweepArmed && !openFailed && !decoderFailed &&
-                       (!planBuilt || planIdx < plan.size());
+                       (!planBuilt || planIdx < plan.size() ||
+                        (persistent && sh->http && !sh->sourceTimeMapAttemptFinished.load()));
             };
             if (sh->hoverTargetUs < 0 && !workLeft()) {
                 if (openFailed || decoderFailed) {
@@ -1587,6 +1671,7 @@ static void spThumbWorkerMain(std::shared_ptr<SPThumbShared> sh,
             }
 
             const SPThumbOpenResult o = ensureOpen(claim);
+            if (o == SPThumbOpenResult::Failed) finishSourceMapAttempt();
             int r = 0;
             if (o == SPThumbOpenResult::Preempted) {
 
@@ -1661,7 +1746,30 @@ static void spThumbWorkerMain(std::shared_ptr<SPThumbShared> sh,
         }
         probeBlockedStreak = 0;
 
-        if (ensureOpen(claim) != SPThumbOpenResult::Ready) continue;
+        // Cached JPEGs can complete the entire plan without ever opening a
+        // context. Keep one metadata-only task behind the same admission gate
+        // so their cache rail still gets Cues on a later paused reopen.
+        const bool metadataOnly = persistent && sh->http && planIdx >= plan.size() &&
+            !sh->sourceTimeMapAttemptFinished.load();
+        sourceMapOnlyOpening = metadataOnly;
+        const SPThumbOpenResult o = ensureOpen(claim);
+        sourceMapOnlyOpening = false;
+        if (metadataOnly) {
+            // The bounded attempt owns its AVIO errors and remaining budget.
+            // Retire it even on success; a later uncached hover opens the
+            // ordinary unbudgeted preview context and keeps the verified map.
+            if (o != SPThumbOpenResult::Preempted) {
+                finishSourceMapAttempt();
+                openFailed = false;
+            }
+            retireHTTPContext();
+            continue;
+        }
+        if (o != SPThumbOpenResult::Ready) {
+            if (o == SPThumbOpenResult::Preempted) retireHTTPContext();
+            else finishSourceMapAttempt();
+            continue;
+        }
         if (planIdx >= plan.size()) continue;
         if (sweepT0 == 0) sweepT0 = spNowUs();
         claim.targetAbsUs = plan[planIdx];
@@ -1893,7 +2001,12 @@ static bool spThumbDustColor(CGImageRef cg, float *hue, float *sat, float *luma)
 - (BOOL)persistentPreparationPending {
     auto sh = _shared;
     return sh && !sh->stop.load() && sh->persistentIntervalUs > 0 &&
-        (!sh->persistentSweepFinished.load() || sh->persistentHoverPending.load());
+        (!sh->persistentSweepFinished.load() || sh->persistentHoverPending.load() ||
+         (sh->http && !sh->sourceTimeMapAttemptFinished.load()));
+}
+
+- (void)_mainSourceTimeMapPreparationFinished {
+    if (_shared && !_shared->stop.load() && _onUpdate) _onUpdate();
 }
 
 - (void)requestPreviewAt:(double)seconds {
@@ -1997,6 +2110,12 @@ static bool spThumbDustColor(CGImageRef cg, float *hue, float *sat, float *luma)
     if (spDebug()) NSLog(@"[c%u][Dust] 关键帧表 %lu 项，扫描桶 %.1fs", _spLogId,
                          (unsigned long)(keys.length / sizeof(SPDustKey)), spacing / 1e6);
     if (_onUpdate) _onUpdate();
+}
+
+- (std::shared_ptr<const spcachetime::SourceMap>)sourceTimeMapSnapshot {
+    if (!_shared || _shared->stop.load()) return {};
+    std::lock_guard<std::mutex> lock(_shared->mtx);
+    return _shared->sourceTimeMap;
 }
 
 - (nullable SPThumbDustSnapshot *)dustSnapshot {

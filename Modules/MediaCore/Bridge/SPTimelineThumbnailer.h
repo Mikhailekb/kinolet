@@ -7,6 +7,11 @@
 #import <Foundation/Foundation.h>
 #import "SPDustSnapshot.h"
 
+#ifdef __cplusplus
+#include <memory>
+namespace spcachetime { struct SourceMap; }
+#endif
+
 NS_ASSUME_NONNULL_BEGIN
 
 // Worker-thread background admission probe: atomic reads only, no blocking or locks.
@@ -67,6 +72,12 @@ typedef BOOL (^SPThumbSeekBusyProbe)(void);
 // Main-thread snapshot of keyframes, verified coverage and thumbnail colors.
 // Reuse the same object while its generation is unchanged; nil before work starts.
 - (nullable SPThumbDustSnapshot *)dustSnapshot;
+
+#ifdef __cplusplus
+// Immutable metadata from the already-admitted private HTTP context. This
+// snapshot performs no I/O and never seeks the main playback context.
+- (std::shared_ptr<const spcachetime::SourceMap>)sourceTimeMapSnapshot;
+#endif
 
 - (void)shutdown; // Idempotent main-thread shutdown.
 

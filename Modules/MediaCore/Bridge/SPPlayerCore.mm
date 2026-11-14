@@ -10896,6 +10896,21 @@ NSErrorUserInfoKey const SPPlayerErrorTerminalKey = @"SPPlayerErrorTerminal";
         if (stream.stream == video) videoIndex = stream.spans;
         if (stream.stream == audio) audioIndex = stream.spans;
     }
+    // The existing admitted preview reader can materialize deferred Cues while
+    // primary playback is paused. Reuse only this open's validated video map;
+    // no source read, seek or playback-state change belongs in this snapshot.
+    if (video >= 0 && _torrentPreviewOpenGeneration == openGen && _thumbnailer) {
+        const auto prepared = [_thumbnailer sourceTimeMapSnapshot];
+        if (prepared && prepared->sourceSize == index->sourceSize &&
+            // Preview setup round-trips the same metadata through seconds.
+            llabs(prepared->durationUs - index->durationUs) <= 1) {
+            for (const auto &stream : prepared->streams) {
+                if (stream.stream == video) {
+                    videoIndex.insert(videoIndex.end(), stream.spans.begin(), stream.spans.end());
+                }
+            }
+        }
+    }
     {
         std::lock_guard<std::mutex> lock(_sourcePacketBytesMtx);
         if (_sourcePacketBytesOpenGeneration == openGen && _sourcePacketBytesSeekGeneration == seekGen) {

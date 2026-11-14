@@ -2650,12 +2650,35 @@ final class SPProgressView: NSView {
         let w = max(bounds.width, 1)
         let midY = bounds.midY
         var any = false
-        for b in damageBands where b.cls == cls {
-            let x0 = max(0, min(w, CGFloat(b.from / damageDuration) * w))
-            let x1 = max(0, min(w, CGFloat(b.until / damageDuration) * w))
-            guard x1 > x0 else { continue }
-            p.addRect(CGRect(x: x0, y: midY - halfBase, width: max(1, x1 - x0), height: 2 * halfBase))
+        func append(_ lower: Double, _ upper: Double) {
+            guard upper > lower else { return }
+            let x0 = CGFloat(lower) * w
+            let x1 = CGFloat(upper) * w
+            // Pending fragments must not grow across resident boundaries when
+            // a real missing gap is narrower than one point.
+            let minimumWidth: CGFloat = cls == SPDamageBand.pending && showsBufferedRanges ? 0 : 1
+            p.addRect(CGRect(x: x0, y: midY - halfBase, width: max(minimumWidth, x1 - x0), height: 2 * halfBase))
             any = true
+        }
+        for b in damageBands where b.cls == cls {
+            let lower = max(0, min(1, b.from / damageDuration))
+            let upper = max(0, min(1, b.until / damageDuration))
+            guard upper > lower else { continue }
+            if cls == SPDamageBand.pending && showsBufferedRanges {
+                // New cache can arrive without a decoder tick or seek. Cut
+                // only the stale pending overlay around its exact intervals.
+                var cursor = lower
+                for resident in bufferedRanges {
+                    if resident.upperBound <= cursor { continue }
+                    if resident.lowerBound >= upper { break }
+                    append(cursor, min(upper, resident.lowerBound))
+                    cursor = max(cursor, min(upper, resident.upperBound))
+                    if cursor >= upper { break }
+                }
+                append(cursor, upper)
+            } else {
+                append(lower, upper)
+            }
         }
         return any ? p : nil
     }

@@ -1,6 +1,7 @@
 import AppKit
 import Metal
 import QuartzCore
+import simd
 
 struct SPDustKey { var tsUs: Int64; var pos: Int64 }
 struct SPDustCover {
@@ -167,6 +168,78 @@ struct SPDamageBand {
             baseline.colorAt(x: $0, y: stripe)!.redComponent < 0.03
         }
         expect(!dark.isEmpty, "Even the loaded segment contains spaces between circular grains, not a filled rectangle")
+
+        // A paused decoder can retain its old pending map while the torrent
+        // downloads more pieces. Keep the playhead and thumbnail state fixed.
+        let paused = SPDustHost()
+        paused.setGeometry(bounds: CGRect(x: 0, y: 0, width: 900, height: 44), scale: 2)
+        paused.setSplit(180)
+        let pending = SPDamageBand(cls: 3, from: 0, until: 600)
+        paused.setDamage(bands: [pending], duration: 600)
+        paused.setBufferedRanges([], visible: true)
+        settle(paused)
+        let pausedBeforeArrival = try image(paused)
+        paused.setBufferedRanges([0.25...0.40, 0.55...0.65, 0.8...0.9], visible: true)
+        settle(paused)
+        let pausedAfterArrival = try image(paused)
+        expect(orangeSeparation(pausedBeforeArrival, from: 0.27, until: 0.38) < 0.01 &&
+               orangeSeparation(pausedAfterArrival, from: 0.27, until: 0.38) > 0.1,
+               "Resident cache turns orange at a frozen paused playhead despite a stale pending map")
+        expect(paused.split == 180 && paused.bins?.coveredBins == 0,
+               "Cache arrival requires neither seek nor preview thumbnails")
+        expect(abs(level(paused, from: 0.27, until: 0.38) - level(host, from: 0.27, until: 0.38)) < 0.001,
+               "Stale pending does not suppress resident particle survival or brightness")
+        expect(orangeSeparation(pausedAfterArrival, from: 0.43, until: 0.5) < 0.01 &&
+               level(paused, from: 0.43, until: 0.5) < 0.1,
+               "True uncached gaps retain pending styling alongside fresh resident pieces")
+        paused.setDamage(bands: [], duration: 600)
+        settle(paused)
+        paused.setDamage(bands: [pending], duration: 600)
+        settle(paused)
+        let pendingAfterCache = try image(paused)
+        expect(abs(level(paused, from: 0.27, until: 0.38) - level(host, from: 0.27, until: 0.38)) < 0.001 &&
+               orangeSeparation(pendingAfterCache, from: 0.27, until: 0.38) > 0.1,
+               "Pending arriving after cache cannot overwrite the resident presentation")
+        paused.setBufferedRanges([0.55...0.65, 0.8...0.9], visible: true)
+        settle(paused)
+        let pausedAfterEviction = try image(paused)
+        expect(orangeSeparation(pausedAfterEviction, from: 0.27, until: 0.38) < 0.01 &&
+               orangeSeparation(pausedAfterEviction, from: 0.56, until: 0.64) > 0.1,
+               "Eviction restores pending only to the removed cache span without a seek")
+        paused.setBufferedRanges([0.25...0.40, 0.55...0.65, 0.8...0.9], visible: true)
+        let confirmedBands = [SPDamageBand(cls: 1, from: 150, until: 240),
+                              SPDamageBand(cls: 2, from: 330, until: 390)]
+        paused.setDamage(bands: confirmedBands, duration: 600)
+        settle(paused)
+        let confirmedGrains = paused.grains
+        expect(level(paused, from: 0.56, until: 0.64) < level(host, from: 0.56, until: 0.64) * 0.8,
+               "Resident bytes do not conceal confirmed unavailable video")
+        expect(paused.home.indices.filter { paused.home[$0] / paused.W > 0.27 && paused.home[$0] / paused.W < 0.38 && paused.grains[$0].lum > 0.01 }
+            .allSatisfy { abs(paused.grains[$0].col.y - host.grains[$0].col.y) > 0.04 },
+               "Resident bytes retain confirmed partial-damage color")
+        paused.setDamage(bands: [pending] + confirmedBands, duration: 600)
+        settle(paused)
+        expect(paused.home.indices.filter { paused.bufferedParticles[$0] }.allSatisfy {
+            let a = confirmedGrains[$0], b = paused.grains[$0]
+            return abs(a.lum - b.lum) < 0.001 && simd_distance(a.col, b.col) < 0.001
+        }, "Pending sharing a bin with confirmed damage preserves the confirmed damage")
+        paused.setDamage(bands: confirmedBands + [pending], duration: 600)
+        settle(paused)
+        expect(paused.home.indices.filter { paused.bufferedParticles[$0] }.allSatisfy {
+            let a = confirmedGrains[$0], b = paused.grains[$0]
+            return abs(a.lum - b.lum) < 0.001 && simd_distance(a.col, b.col) < 0.001
+        }, "Mixed pending and confirmed damage are independent of input ordering")
+        // A tiny confirmed band shares a thumbnail bin with a pending hint.
+        let tinyConfirmed = SPDamageBand(cls: 2, from: 192.001, until: 192.002)
+        paused.setDamage(bands: [tinyConfirmed], duration: 600)
+        settle(paused)
+        let tinyGrains = paused.grains
+        paused.setDamage(bands: [tinyConfirmed, pending], duration: 600)
+        settle(paused)
+        expect(paused.home.indices.filter { paused.bufferedParticles[$0] }.allSatisfy {
+            let a = tinyGrains[$0], b = paused.grains[$0]
+            return abs(a.lum - b.lum) < 0.001 && simd_distance(a.col, b.col) < 0.001
+        }, "A sub-bin confirmed defect survives a larger stale pending band")
         host.setBufferedRanges([0.55...0.65], visible: true)
         _ = host.step(dt: 1 / 60)
         expect(level(host, from: 0.27, until: 0.38) < 0.15, "Eviction immediately dims its old particles without waiting for a bloom")
@@ -207,6 +280,9 @@ struct SPDamageBand {
             try baseline.representation(using: .png, properties: [:])!.write(to: directory.appendingPathComponent("particle-cache-metal.png"))
             try light.representation(using: .png, properties: [:])!.write(to: directory.appendingPathComponent("particle-cache-metal-light.png"))
             try hovered.representation(using: .png, properties: [:])!.write(to: directory.appendingPathComponent("particle-cache-metal-hover.png"))
+            try pausedBeforeArrival.representation(using: .png, properties: [:])!.write(to: directory.appendingPathComponent("paused-before-arrival.png"))
+            try pausedAfterArrival.representation(using: .png, properties: [:])!.write(to: directory.appendingPathComponent("paused-after-arrival.png"))
+            try pausedAfterEviction.representation(using: .png, properties: [:])!.write(to: directory.appendingPathComponent("paused-after-eviction.png"))
         }
         print("Particle cache checks passed (\(checks) assertions; actual grain generation and offscreen Metal shader).")
     }

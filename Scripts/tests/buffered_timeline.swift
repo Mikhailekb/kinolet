@@ -69,6 +69,14 @@ struct BufferedTimelineChecks {
         context.setFillColor(NSColor.black.cgColor)
         context.fill(CGRect(x: 0, y: 0, width: image.pixelsWide, height: image.pixelsHigh))
         context.scaleBy(x: CGFloat(scale), y: CGFloat(scale))
+        // CALayer.render(in:) walks array order, unlike the on-screen
+        // compositor's zPosition ordering. Render these same production layers
+        // in their stable painter order so damage overlays are actually tested.
+        let layers = view.layer!.sublayers ?? []
+        view.layer!.sublayers = layers.enumerated().sorted {
+            $0.element.zPosition == $1.element.zPosition ? $0.offset < $1.offset : $0.element.zPosition < $1.element.zPosition
+        }.map(\.element)
+        defer { view.layer!.sublayers = layers }
         view.layer!.render(in: context)
         return image
     }
@@ -81,6 +89,10 @@ struct BufferedTimelineChecks {
             .usingColorSpace(.sRGB)!
         return color.redComponent > 0.95 && abs(color.greenComponent - 182 / 255) < 0.04 &&
             abs(color.blueComponent - 92 / 255) < 0.04
+    }
+    static func damage(_ view: NSView, color: NSColor) -> CAShapeLayer {
+        view.layer!.sublayers!.compactMap { $0 as? CAShapeLayer }
+            .first { $0.zPosition == 15 && $0.fillColor == color.cgColor }!
     }
     static func main() throws {
         NSApplication.shared.setActivationPolicy(.prohibited)
@@ -102,6 +114,58 @@ struct BufferedTimelineChecks {
                "Uncached gaps stay visibly dark")
         expect(orange(initial, x: 0.55) && orange(initial, x: 0.85),
                "Discontinuous cached segments are drawn at their supplied media times")
+
+        let paused = SPProgressView(frame: NSRect(x: 0, y: 0, width: 400, height: 44))
+        paused.setValue(0.2)
+        let pending = SPDamageBand(cls: SPDamageBand.pending, from: 0, until: 10)
+        paused.setDamage(bands: [pending], duration: 10)
+        paused.setBufferedRanges([], visible: true)
+        let pendingLayer = damage(paused, color: SPDamage.pendingColor)
+        let pausedBeforeArrival = pixels(paused)
+        expect(pendingLayer.path!.contains(CGPoint(x: 100, y: 22)) && white(pausedBeforeArrival, x: 0.25) < 0.05,
+               "An actually missing paused span keeps its pending overlay")
+        paused.setBufferedRanges([0.1...0.3, 0.5...0.6, 0.8...0.9], visible: true)
+        let pausedAfterArrival = pixels(paused)
+        expect(orange(pausedAfterArrival, x: 0.25) && orange(pausedAfterArrival, x: 0.55) &&
+               !pendingLayer.path!.contains(CGPoint(x: 100, y: 22)),
+               "Cache arrival removes stale pending from resident spans without moving the playhead")
+        expect(white(pausedAfterArrival, x: 0.15) > 0.95 &&
+               abs(shape(paused, "played").path!.boundingBox.width - 80) < 0.001,
+               "Known resident played media stays white at the frozen playback position")
+        expect(pendingLayer.path!.contains(CGPoint(x: 160, y: 22)) && white(pausedAfterArrival, x: 0.4) < 0.05,
+               "Pending remains visible inside real gaps between resident spans")
+        paused.setDamage(bands: [], duration: 10)
+        paused.setDamage(bands: [pending], duration: 10)
+        expect(orange(pixels(paused), x: 0.55) && !pendingLayer.path!.contains(CGPoint(x: 220, y: 22)),
+               "Pending arriving after cache cannot repaint a resident solid segment")
+        paused.setBufferedRanges([0.1...0.3, 0.5...0.55, 0.5502...0.6], visible: true)
+        expect(pendingLayer.path!.contains(CGPoint(x: 0.5501 * 400, y: 22)) &&
+               !pendingLayer.path!.contains(CGPoint(x: 0.5504 * 400, y: 22)),
+               "A sub-point missing gap stays exact without extending pending into adjacent cache")
+        paused.setBufferedRanges([0.1...0.3], visible: true)
+        let pausedAfterEviction = pixels(paused)
+        expect(pendingLayer.path!.contains(CGPoint(x: 220, y: 22)) && white(pausedAfterEviction, x: 0.55) < 0.05,
+               "Eviction restores pending over precisely the removed resident span")
+        paused.setBufferedRanges([0.1...0.3, 0.5...0.6], visible: true)
+        paused.setDamage(bands: [pending, .init(cls: SPDamageBand.partial, from: 2.4, until: 2.6),
+                                .init(cls: SPDamageBand.none, from: 5.4, until: 5.6)], duration: 10)
+        expect(damage(paused, color: SPDamage.partialColor).path!.contains(CGPoint(x: 100, y: 22)) &&
+               damage(paused, color: SPDamage.noneColor).path!.contains(CGPoint(x: 220, y: 22)),
+               "Confirmed partial and unavailable damage still cover resident bytes beneath stale pending")
+        paused.setDamage(bands: [pending], duration: 10)
+        paused.applyStyle(.tide)
+        paused.pointerEntered(atX: 220)
+        expect(orange(pixels(paused), x: 0.55) && pendingLayer.path!.contains(CGPoint(x: 160, y: 22)),
+               "Liquid style keeps the same resident-over-pending precedence and real gaps")
+        paused.pointerExited()
+        paused.applyStyle(.classic)
+        paused.setBufferedRanges([0...1], visible: true)
+        expect(pendingLayer.path == nil && orange(pixels(paused), x: 0.85),
+               "Full residency removes the entire stale pending overlay in classic style")
+        paused.setBufferedRanges([], visible: false)
+        expect(pendingLayer.path!.contains(CGPoint(x: 100, y: 22)),
+               "Local-media mode retains the original full pending presentation")
+
         view.setBufferedRanges([0.1...0.3, 0.8...0.9], visible: true)
         expect(white(pixels(view), x: 0.55) < 0.25, "Evicted cache immediately removes its previous orange segment")
         view.setBufferedRanges([], visible: true)
@@ -168,6 +232,9 @@ struct BufferedTimelineChecks {
             let directory = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             try pixels(view).representation(using: .png, properties: [:])!.write(to: directory.appendingPathComponent("cached-timeline.png"))
+            try pausedBeforeArrival.representation(using: .png, properties: [:])!.write(to: directory.appendingPathComponent("paused-before-arrival.png"))
+            try pausedAfterArrival.representation(using: .png, properties: [:])!.write(to: directory.appendingPathComponent("paused-after-arrival.png"))
+            try pausedAfterEviction.representation(using: .png, properties: [:])!.write(to: directory.appendingPathComponent("paused-after-eviction.png"))
         }
         expect(view.window == nil, "Tests render detached layers without opening or inspecting a user window")
         print("Buffered timeline checks passed (\(checks) assertions; deterministic peripheral Dust stub, actual AppKit progress paths).")

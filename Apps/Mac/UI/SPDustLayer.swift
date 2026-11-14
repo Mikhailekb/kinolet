@@ -606,6 +606,7 @@ final class SPDustHost: NSObject {
     // Resilient playback damage bands (bucket-level channel): 0 fluent, 1 partial, 2 none, 3 not downloaded yet; healthy files pass an empty array at zero cost.
     private var damageBands: [SPDamageBand] = []
     private var damageBins: [UInt8] = []
+    private var confirmedDamageBins: [UInt8] = []
     func setDamage(bands: [SPDamageBand], duration: Double) {
         damageBands = bands
         if duration > 0 { durationUs = Int64(duration * 1e6) }
@@ -613,16 +614,28 @@ final class SPDustHost: NSObject {
         kick()
     }
     private func rebuildDamageBins() {
-        guard let bins, !damageBands.isEmpty, durationUs > 0 else { damageBins = []; return }
+        guard let bins, !damageBands.isEmpty, durationUs > 0 else {
+            damageBins = []; confirmedDamageBins = []
+            return
+        }
         let B = bins.count
         var out = [UInt8](repeating: 0, count: B)
+        var confirmed = [UInt8](repeating: 0, count: B)
         let dur = Double(durationUs) / 1e6
         for b in damageBands {
             let b0 = max(0, min(B - 1, Int(b.from / dur * Double(B))))
             let b1 = max(0, min(B - 1, Int((b.until / dur * Double(B)).rounded(.up)) - 1))
-            if b1 >= b0 { for i in b0...b1 { out[i] = max(out[i], UInt8(clamping: b.cls)) } }
+            if b1 >= b0 {
+                for i in b0...b1 {
+                    out[i] = max(out[i], UInt8(clamping: b.cls))
+                    if b.cls == 1 || b.cls == 2 {
+                        confirmed[i] = max(confirmed[i], UInt8(clamping: b.cls))
+                    }
+                }
+            }
         }
         damageBins = out
+        confirmedDamageBins = confirmed
     }
 
     /// Track when each sample key appears. Treat the initial snapshot as established
@@ -838,7 +851,12 @@ final class SPDustHost: NSObject {
             // Reduce unplayed non-rail survival for unavailable and pending regions.
             // The guide rail stays present. Later color mapping uses amber for partial
             // content, red for unavailable content, and neutral gray for pending data.
-            let dmg: UInt8 = damageBins.isEmpty ? 0 : damageBins[bi]
+            let reportedDamage: UInt8 = damageBins.isEmpty ? 0 : damageBins[bi]
+            // The decoder's pending map can stay unchanged while playback is
+            // paused. Fresh resident pieces are stronger evidence than that
+            // old "not downloaded yet" hint, but not than actual corruption.
+            let dmg: UInt8 = showsBufferedRanges && cached && reportedDamage == 3
+                ? (confirmedDamageBins.isEmpty ? 0 : confirmedDamageBins[bi]) : reportedDamage
             if dmg == 2 { dv *= 0.12 } else if dmg == 3 { dv *= 0.3 }
             let tt = min(1, max(0, (split - hx) / t.zone + 0.5))
             let isRail = rail[i]
