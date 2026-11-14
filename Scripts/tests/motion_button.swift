@@ -42,18 +42,19 @@ struct MotionButtonChecks {
         let badge = named(button, "sp.motion.fpsBadge", as: CALayer.self)
         let text = named(button, "sp.motion.fpsText", as: CATextLayer.self)
         let originals = named(button, "sp.motion.frames", as: CAShapeLayer.self)
-        let generated = named(button, "sp.motion.generatedFrame", as: CAShapeLayer.self)
         let inserted = named(button, "sp.motion.insertedPlus", as: CAShapeLayer.self)
         expect(button.preferredWidth == 36 && button.frame.size == NSSize(width: 36, height: 32), "The control remains compact")
         expect(text.string as? String == "60", "The counter shows measured output cadence")
         expect(button.toolTip?.contains("24 → 60 fps") == true, "Tooltip distinguishes source from measured output")
-        expect(generated.lineDashPattern == nil && originals.path != nil && inserted.path != nil,
-               "The selected filmstrip uses a solid inserted cell with a plus between the original cells")
-        expect(generated.path!.boundingBoxOfPath.contains(inserted.path!.boundingBoxOfPath),
-               "The insertion plus stays inside its middle frame")
-        expect(originals.path!.boundingBoxOfPath.width > 2.5 * generated.path!.boundingBoxOfPath.width,
-               "The filmstrip spans separate horizontal frames rather than overlapping PiP windows")
-        expect(originals.frame == generated.frame && !originals.frame.intersects(badge.frame), "Frames and FPS badge remain separate")
+        let frameBounds = originals.path!.boundingBoxOfPath
+        let plusBounds = inserted.path!.boundingBoxOfPath
+        expect(frameBounds.width > frameBounds.height && frameBounds.height >= 8,
+               "One large landscape frame replaces the tiny filmstrip cells")
+        expect(plusBounds.width >= 5.5 && plusBounds.height >= 5.5 && inserted.lineWidth >= 1.5,
+               "The plus remains bold and recognizable at actual size")
+        expect(frameBounds.maxX + originals.lineWidth / 2 < plusBounds.minX - inserted.lineWidth / 2,
+               "Frame and plus have a clear gap instead of overlapping windows")
+        expect(!originals.frame.intersects(badge.frame), "Pictogram and FPS badge remain separate")
         let amber = NSColor(cgColor: text.foregroundColor!)!.usingColorSpace(.sRGB)!
         expect(amber.redComponent > 0.95 && amber.greenComponent > 0.65 && amber.blueComponent < 0.45, "Enabled FPS badge uses the established warm orange")
         expect(button.isEnabled && button.state == .on, "Measured readouts preserve the requested On state")
@@ -86,6 +87,9 @@ struct MotionButtonChecks {
             configure(button, model(output: 240))
             expect(button.bounds.contains(badge.frame) && badge.bounds.contains(text.frame.insetBy(dx: 0, dy: 0.2)),
                    "Badge and three-digit label fit compact and regular widths")
+            expect(originals.path!.boundingBoxOfPath.maxX + originals.lineWidth / 2 <
+                   inserted.path!.boundingBoxOfPath.minX - inserted.lineWidth / 2,
+                   "The compact glyph retains clear separation between frame and plus")
         }
         if CommandLine.arguments.count == 2 {
             let output = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
@@ -101,6 +105,10 @@ struct MotionButtonChecks {
                 configure(button, value)
                 try NSBitmapImageRep(cgImage: image(button)).representation(using: .png, properties: [:])!
                     .write(to: output.appendingPathComponent(name + ".png"))
+                for scale: CGFloat in [1, 2] {
+                    try NSBitmapImageRep(cgImage: image(button, scale: scale)).representation(using: .png, properties: [:])!
+                        .write(to: output.appendingPathComponent(name + "-\(Int(scale))x.png"))
+                }
                 let window = NSWindow(contentRect: NSRect(x: -2000, y: -2000, width: width, height: 32),
                     styleMask: [.borderless], backing: .buffered, defer: false)
                 window.isReleasedWhenClosed = false

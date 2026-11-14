@@ -34,7 +34,6 @@ final class SPMotionButton: NSButton, CAAnimationDelegate {
     private let focusRing = CAShapeLayer()
     private let foreground = CALayer()
     private let frames = CAShapeLayer()
-    private let generatedFrame = CAShapeLayer()
     private let insertedPlus = CAShapeLayer()
     private let fpsBadge = CALayer()
     private let fpsText = CATextLayer()
@@ -102,7 +101,6 @@ final class SPMotionButton: NSButton, CAAnimationDelegate {
         guard let layer else { return }
         surface.name = "sp.motion.surface"
         frames.name = "sp.motion.frames"
-        generatedFrame.name = "sp.motion.generatedFrame"
         insertedPlus.name = "sp.motion.insertedPlus"
         fpsBadge.name = "sp.motion.fpsBadge"
         fpsText.name = "sp.motion.fpsText"
@@ -159,14 +157,10 @@ final class SPMotionButton: NSButton, CAAnimationDelegate {
         layer.addSublayer(foreground)
         frames.strokeColor = NSColor.white.withAlphaComponent(0.95).cgColor
         frames.fillColor = NSColor.clear.cgColor
-        frames.lineWidth = 0.9
+        frames.lineWidth = 1.5
         frames.lineCap = .round
         frames.lineJoin = .round
         foreground.addSublayer(frames)
-        generatedFrame.lineWidth = 1.05
-        generatedFrame.lineCap = .round
-        generatedFrame.lineJoin = .round
-        foreground.addSublayer(generatedFrame)
         insertedPlus.fillColor = NSColor.clear.cgColor
         insertedPlus.lineCap = .round
         insertedPlus.lineJoin = .round
@@ -267,8 +261,6 @@ final class SPMotionButton: NSButton, CAAnimationDelegate {
             light.isHidden = !animationRunning || !selected || !isEnabled
             light.opacity = 0
         }
-        generatedFrame.strokeColor = (selected ? Palette.amber : NSColor.white.withAlphaComponent(0.82)).cgColor
-        generatedFrame.fillColor = NSColor.black.withAlphaComponent(selected ? 0.42 : 0.08).cgColor
         insertedPlus.strokeColor = (selected ? Palette.amber : NSColor.white.withAlphaComponent(0.9)).cgColor
         fpsBadge.backgroundColor = (selected
             ? NSColor.black.withAlphaComponent(highlighted ? 0.50 : 0.36)
@@ -318,47 +310,27 @@ final class SPMotionButton: NSButton, CAAnimationDelegate {
         let side = max(60, body.width * 2)
         borderGradient.frame = CGRect(x: (body.width - side) / 2, y: (body.height - side) / 2, width: side, height: side)
         foreground.frame = bounds
-        // Selected concept: a horizontal perforated filmstrip, with two
-        // original landscape cells around an inserted middle cell carrying +.
-        // Separate cells and rails distinguish generation from PiP windows.
+        // A single video frame and a separate bold plus stay readable at the
+        // actual control size. Film perforations and tiny inner cells did not.
         let glyphWidth = min(24, max(16, body.width - 6))
         let glyphHeight: CGFloat = 10.8
         frames.frame = CGRect(x: bounds.midX - glyphWidth / 2, y: body.maxY - 13.2,
                               width: glyphWidth, height: glyphHeight)
-        let frameWidth = (glyphWidth - 4.4) / 3
-        let frameStep = frameWidth + 1.6
-        let frameHeight = min(4.3, frameWidth / 1.5)
-        let cellY = (glyphHeight - frameHeight) / 2
-        let framesPath = CGMutablePath()
-        for y: CGFloat in [0.45, glyphHeight - 0.45] {
-            framesPath.move(to: CGPoint(x: 0.55, y: y))
-            framesPath.addLine(to: CGPoint(x: glyphWidth - 0.55, y: y))
-        }
-        for y: CGFloat in [1.95, glyphHeight - 1.95] {
-            for index in 0..<6 {
-                let x = 1.3 + CGFloat(index) * (glyphWidth - 2.6) / 5
-                framesPath.move(to: CGPoint(x: x - 0.3, y: y))
-                framesPath.addLine(to: CGPoint(x: x + 0.3, y: y))
-            }
-        }
-        for x in [CGFloat(0.6), 0.6 + 2 * frameStep] {
-            framesPath.addRoundedRect(in: CGRect(x: x, y: cellY, width: frameWidth, height: frameHeight),
-                                      cornerWidth: 0.8, cornerHeight: 0.8)
-        }
-        frames.path = framesPath
-        generatedFrame.frame = frames.frame
-        let insertedRect = CGRect(x: 0.6 + frameStep, y: cellY, width: frameWidth, height: frameHeight)
-        generatedFrame.path = CGPath(roundedRect: insertedRect, cornerWidth: 0.8,
-                                     cornerHeight: 0.8, transform: nil)
+        let scale = glyphWidth / 24
+        let frameRect = CGRect(x: 0.8, y: 1.2, width: 13 * scale, height: 8.4)
+        frames.path = CGPath(roundedRect: frameRect, cornerWidth: 1.35,
+                             cornerHeight: 1.35, transform: nil)
+        // Keep the frame neutral; the addition carries the active accent.
         insertedPlus.frame = frames.frame
-        let arm = min(frameHeight * 0.28, frameWidth * 0.23)
+        let arm = 2.9 * scale
+        let center = CGPoint(x: glyphWidth - arm - 0.85, y: glyphHeight / 2)
         let plus = CGMutablePath()
-        plus.move(to: CGPoint(x: insertedRect.midX - arm, y: insertedRect.midY))
-        plus.addLine(to: CGPoint(x: insertedRect.midX + arm, y: insertedRect.midY))
-        plus.move(to: CGPoint(x: insertedRect.midX, y: insertedRect.midY - arm))
-        plus.addLine(to: CGPoint(x: insertedRect.midX, y: insertedRect.midY + arm))
+        plus.move(to: CGPoint(x: center.x - arm, y: center.y))
+        plus.addLine(to: CGPoint(x: center.x + arm, y: center.y))
+        plus.move(to: CGPoint(x: center.x, y: center.y - arm))
+        plus.addLine(to: CGPoint(x: center.x, y: center.y + arm))
         insertedPlus.path = plus
-        insertedPlus.lineWidth = body.width < 28 ? 0.7 : 0.9
+        insertedPlus.lineWidth = 1.6
         let badgeWidth = min(25, max(20, body.width - 5))
         fpsBadge.frame = CGRect(x: bounds.midX - badgeWidth / 2, y: body.minY + 2.4,
                                width: badgeWidth, height: 10.8)
@@ -386,7 +358,7 @@ final class SPMotionButton: NSButton, CAAnimationDelegate {
     }
     private func updateContentsScale() {
         let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
-        for drawing in [frames, generatedFrame, insertedPlus, fpsText, borderMask, halo, focusRing] { drawing.contentsScale = scale }
+        for drawing in [frames, insertedPlus, fpsText, borderMask, halo, focusRing] { drawing.contentsScale = scale }
     }
     override func viewDidChangeBackingProperties() {
         super.viewDidChangeBackingProperties()
