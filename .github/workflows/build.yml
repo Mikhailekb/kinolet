@@ -110,6 +110,7 @@ jobs:
           run_check ./Scripts/test_turbo_speed.sh
           run_check ./Scripts/test_video_click.sh
           run_check ./Scripts/test_video_hold_turbo.sh
+          run_check ./Scripts/test_chrome_idle.sh
           run_check ./Scripts/test_playback_feedback.sh
           run_check ./Scripts/test_playback_control_intent.sh
           run_check ./Scripts/test_playback_diagnostics.sh
