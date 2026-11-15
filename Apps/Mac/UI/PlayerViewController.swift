@@ -1568,12 +1568,14 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         hideControlsTimer?.invalidate()
         guard !Self.pinControls else { return }
         let timer = Timer.scheduledTimer(withTimeInterval: t, repeats: false) { [weak self] _ in
-            guard let self else { return }
-            let remain = self.hideDeadline - ProcessInfo.processInfo.systemUptime
-            if remain > 0.05 {
-                self.armHideTimer(after: remain)
-            } else {
-                self.hideControls()
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                let remain = self.hideDeadline - ProcessInfo.processInfo.systemUptime
+                if remain > 0.05 {
+                    self.armHideTimer(after: remain)
+                } else {
+                    self.hideControls()
+                }
             }
         }
         timer.tolerance = 0.5
