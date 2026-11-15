@@ -61,6 +61,22 @@ struct VideoClickGestureChecks {
         gesture.mouseDragged(windowOrigin: CGPoint(x: 101, y: 200), pointer: pointer)
         expect(up(&gesture) == nil, "A window dragged back to its original position remains a drag")
         down(&gesture)
+        let displaced = CGPoint(x: 800, y: 900)
+        gesture.mouseDragged(windowOrigin: origin, pointer: displaced, allowsPointerMovement: true)
+        expect(gesture.isTracking, "An active hold captures pointer movement")
+        let held = gesture.mouseUp(sameWindow: true, windowOrigin: origin, pointer: displaced,
+                                   allowsPointerMovement: true)
+        expect(held != nil && gesture.consume(held!), "A displaced hold release commits exactly once")
+        expect(!gesture.consume(held!), "The captured release cannot be replayed")
+        down(&gesture)
+        gesture.mouseDragged(windowOrigin: CGPoint(x: 101, y: 200), pointer: displaced,
+                             allowsPointerMovement: true)
+        expect(!gesture.isTracking, "Pointer capture does not permit native window dragging")
+        down(&gesture)
+        expect(gesture.mouseUp(sameWindow: true, windowOrigin: CGPoint(x: 101, y: 200),
+                               pointer: displaced, allowsPointerMovement: true) == nil,
+               "Native window movement also cancels on a captured release")
+        down(&gesture)
         expect(up(&gesture, sameWindow: false) == nil, "Releasing in a different window does nothing")
 
         down(&gesture, eligible: false)

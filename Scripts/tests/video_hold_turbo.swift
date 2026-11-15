@@ -407,15 +407,44 @@ private enum SPHoldControl { case toggle }
             mouse(owner, window, down: false); space(owner, down: false)
             check(owner.core?.toggles == 0 && owner.core?.rates.isEmpty == true, "overlapping short presses do not become accidental pause taps")
         }
-        for active in [false, true] {
+        do {
             let (owner, window) = fixture(); defer { owner.shutdown() }
             mouse(owner, window, down: true)
-            if active { waitUntil { owner.turbo.phase == .active } }
             SPHoldFixtureInput.pointer.x += 5; owner.drag()
             SPHoldFixtureInput.pointer.x -= 5
             mouse(owner, window, down: false); wait(0.30)
             check(owner.core?.playbackRate == 1.25 && owner.core?.toggles == 0, "sticky movement cancellation restores and suppresses late tap")
-            check(owner.turboHUD?.visible == false, "drag cancellation removes charging/active HUD")
+            check(owner.turboHUD?.visible == false, "drag cancellation removes charging HUD")
+        }
+        for delivery in ["drag", "watchdog"] {
+            let (owner, window) = fixture(); defer { owner.shutdown() }
+            mouse(owner, window, down: true)
+            waitUntil { owner.turbo.phase == .active }
+            SPHoldFixtureInput.pointer.x += 120
+            SPHoldFixtureInput.pointer.y += 35
+            if delivery == "drag" { owner.drag() } else { owner.poll() }
+            check(owner.turbo.phase == .active && owner.core?.playbackRate == 2 &&
+                  owner.turbo.hasOwner(.mouse) && owner.turboHUD?.active == true,
+                  "active mouse hold survives pointer displacement through \(delivery)")
+            wait(0.12)
+            check(owner.core?.rates == [2] && owner.turbo.phase == .active,
+                  "common-mode watchdog keeps the moved pointer's hold active")
+            mouse(owner, window, down: false)
+            check(owner.core?.rates == [2, 1.25] && owner.core?.toggles == 0 && owner.turbo.owners.isEmpty,
+                  "release at the displaced pointer restores original speed exactly once")
+        }
+        for point in [CGPoint(x: 300, y: 30), CGPoint(x: 800, y: 500)] {
+            let (owner, window) = fixture(); defer { owner.shutdown() }
+            mouse(owner, window, down: true)
+            waitUntil { owner.turbo.phase == .active }
+            SPHoldFixtureInput.pointer = window.convertPoint(toScreen: point)
+            owner.drag(); owner.poll()
+            check(owner.core?.playbackRate == 2 && owner.turbo.phase == .active,
+                  "an active video press stays captured over controls or outside the video")
+            SPHoldFixtureInput.buttons = 0; owner.poll()
+            mouse(owner, window, down: false, point: point)
+            check(owner.core?.rates == [2, 1.25] && owner.core?.toggles == 0,
+                  "captured release and queued native up restore speed without a stray click")
         }
         do {
             let (owner, window) = fixture(); defer { owner.shutdown() }

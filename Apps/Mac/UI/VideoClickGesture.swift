@@ -20,19 +20,22 @@ struct SPVideoClickGesture {
         candidate = (windowOrigin, pointer)
     }
 
-    mutating func mouseDragged(windowOrigin: CGPoint, pointer: CGPoint) {
+    mutating func mouseDragged(windowOrigin: CGPoint, pointer: CGPoint,
+                              allowsPointerMovement: Bool = false) {
         guard let candidate else { return }
-        if moved(from: candidate, windowOrigin: windowOrigin, pointer: pointer) {
+        if moved(from: candidate, windowOrigin: windowOrigin, pointer: pointer,
+                 allowsPointerMovement: allowsPointerMovement) {
             cancel()
         }
     }
 
     mutating func mouseUp(sameWindow: Bool, windowOrigin: CGPoint,
-                          pointer: CGPoint) -> Token? {
+                          pointer: CGPoint, allowsPointerMovement: Bool = false) -> Token? {
         guard let candidate else { return nil }
         self.candidate = nil
         guard sameWindow,
-              !moved(from: candidate, windowOrigin: windowOrigin, pointer: pointer) else {
+              !moved(from: candidate, windowOrigin: windowOrigin, pointer: pointer,
+                     allowsPointerMovement: allowsPointerMovement) else {
             cancel()
             return nil
         }
@@ -54,8 +57,10 @@ struct SPVideoClickGesture {
     }
 
     private func moved(from candidate: (windowOrigin: CGPoint, pointer: CGPoint),
-                       windowOrigin: CGPoint, pointer: CGPoint) -> Bool {
+                       windowOrigin: CGPoint, pointer: CGPoint,
+                       allowsPointerMovement: Bool) -> Bool {
         windowOrigin != candidate.windowOrigin ||
-            hypot(pointer.x - candidate.pointer.x, pointer.y - candidate.pointer.y) > Self.movementTolerance
+            (!allowsPointerMovement &&
+             hypot(pointer.x - candidate.pointer.x, pointer.y - candidate.pointer.y) > Self.movementTolerance)
     }
 }

@@ -1608,6 +1608,10 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     private var videoClick = SPVideoClickGesture()
     nonisolated(unsafe) private var clickUpMonitor: Any?
 
+    private var isActiveVideoHold: Bool {
+        turbo.phase == .active && turbo.hasOwner(.mouse)
+    }
+
     private func isVideoPlaybackPoint(_ point: NSPoint) -> Bool {
         guard playerView.bounds.contains(point) else { return false }
         // PiP relocates the same PlayerView to another window. Its controls own
@@ -1663,7 +1667,8 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
 
     private func cancelClickCandidateIfDragged() {
         guard let win = playerView.window else { cancelVideoClick(); return }
-        videoClick.mouseDragged(windowOrigin: win.frame.origin, pointer: NSEvent.mouseLocation)
+        videoClick.mouseDragged(windowOrigin: win.frame.origin, pointer: NSEvent.mouseLocation,
+                                allowsPointerMovement: isActiveVideoHold)
         if !videoClick.isTracking { cancelVideoClick() }
     }
 
@@ -1687,13 +1692,13 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
         }
         guard let win = playerView.window, win.isKeyWindow, win.attachedSheet == nil,
               hasMediaSession, !isSettingsPanelShown, !isPlaylistShown else { cancelVideoClick(); return }
-        // Geometry is sticky and must be rejected before interpreting a missing
-        // button as a release. The real mouseUp may still be queued behind this
-        // timer; both paths consume the same candidate exactly once.
+        // Window movement always cancels. Once Turbo engages, capture the mouse
+        // until release even if its pointer leaves the video or crosses controls.
+        // The watchdog and queued mouseUp consume that release exactly once.
         cancelClickCandidateIfDragged()
         guard turbo.hasOwner(.mouse) else { return }
         let point = playerView.convert(win.convertPoint(fromScreen: NSEvent.mouseLocation), from: nil)
-        guard isVideoPlaybackPoint(point) else { cancelVideoClick(); return }
+        guard isActiveVideoHold || isVideoPlaybackPoint(point) else { cancelVideoClick(); return }
         if NSEvent.pressedMouseButtons & 1 == 0 { finishVideoPress(sameWindow: true) }
     }
 
@@ -1712,10 +1717,12 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
             return
         }
         let point = playerView.convert(win.convertPoint(fromScreen: NSEvent.mouseLocation), from: nil)
-        guard isVideoPlaybackPoint(point),
+        let activeHold = isActiveVideoHold
+        guard activeHold || isVideoPlaybackPoint(point),
               let token = videoClick.mouseUp(sameWindow: sameWindow,
                                              windowOrigin: win.frame.origin,
-                                             pointer: NSEvent.mouseLocation) else {
+                                             pointer: NSEvent.mouseLocation,
+                                             allowsPointerMovement: activeHold) else {
             cancelVideoClick()
             return
         }
