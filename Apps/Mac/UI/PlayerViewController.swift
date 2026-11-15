@@ -1588,7 +1588,9 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
 
         if Self.useNewUI, let chrome, !chrome.isHidden, let win = view.window {
             let p = view.convert(win.mouseLocationOutsideOfEventStream, from: nil)
-            if chrome.hitTest(p) != nil { armHideTimer(after: 1.0); return }
+            // Empty chrome absorbs clicks below the timeline, but only a real
+            // control under the pointer should keep the idle panel visible.
+            if let hit = chrome.hitTest(p), hit !== chrome { armHideTimer(after: 1.0); return }
         }
         isControlBarVisible = false
         if Self.dbg { NSLog("[Chrome] 空闲隐藏") }
