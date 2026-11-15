@@ -94,6 +94,12 @@ final class SPPlaybackCursorController {
         apply()
     }
 
+    /// A held button can defer hiding after chrome disappears. Recheck its
+    /// existing visibility request on release without revealing controls.
+    func refreshAfterMouseRelease() {
+        apply()
+    }
+
     private func observe(_ name: Notification.Name, object: AnyObject?,
                          action: @escaping @MainActor (SPPlaybackCursorController) -> Void) {
         observers.append(NotificationCenter.default.addObserver(

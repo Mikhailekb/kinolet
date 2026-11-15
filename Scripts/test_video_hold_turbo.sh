@@ -56,7 +56,20 @@ methods = methods.replace('NSEvent.mouseLocation', 'SPHoldFixtureInput.pointer')
 methods = methods.replace('NSEvent.pressedMouseButtons', 'SPHoldFixtureInput.buttons')
 methods = methods.replace('SPTurboSettings.isEnabled', 'SPHoldFixtureInput.enabled')
 methods = methods.replace('SPTurboSettings.rate', 'SPHoldFixtureInput.configuredRate')
+cursor = (root / 'Apps/Mac/UI/SPPlaybackCursorController.swift').read_text()
+# Preserve the complete production cursor controller, including gates,
+# notifications and ownership. Substitute only OS state sampled by its gates.
+for old, new in [
+    ('NSApp.isActive', 'SPHoldFixtureInput.appActive'),
+    ('NSApp.modalWindow', 'SPHoldFixtureInput.modalWindow'),
+    ('NSEvent.mouseLocation', 'SPHoldFixtureInput.pointer'),
+    ('NSEvent.pressedMouseButtons', 'SPHoldFixtureInput.buttons'),
+    ('NSWindow.windowNumber(at: point, belowWindowWithWindowNumber: 0)',
+     'SPHoldFixtureInput.topWindowNumber')]:
+    assert old in cursor, old
+    cursor = cursor.replace(old, new)
 fixture = (root / 'Scripts/tests/video_hold_turbo.swift').read_text()
+assert fixture.count('// INSERT_PRODUCTION_CURSOR') == 1
 assert fixture.count('    // INSERT_PRODUCTION_METHODS') == 1
 chrome = (root / 'Apps/Mac/UI/SPChrome.swift').read_text()
 start, end = '    func videoGestureExclusionRect(in targetView: NSView)', '    func layoutChrome(in parentBounds: NSRect)'
@@ -67,7 +80,8 @@ assert source.count(start) == 1
 double_click = start + source.split(start, 1)[1].split(end, 1)[0]
 (output / 'checks.swift').write_text(fixture.replace('    // INSERT_PRODUCTION_METHODS', methods)
     .replace('    // INSERT_PRODUCTION_CHROME_METHODS', chrome_methods)
-    .replace('        // INSERT_PRODUCTION_DOUBLE_CLICK', double_click))
+    .replace('        // INSERT_PRODUCTION_DOUBLE_CLICK', double_click)
+    .replace('// INSERT_PRODUCTION_CURSOR', cursor))
 # Guard the production call sites which are intentionally outside this focused
 # projection (full controller compilation is the application build's job).
 assert 'case turboSpaceKeyCode, 53, 125, 126: return true' in source

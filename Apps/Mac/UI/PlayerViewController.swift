@@ -1709,6 +1709,7 @@ final class PlayerViewController: NSViewController, SPPlayerCoreDelegate, NSMenu
     }
 
     private func finishVideoPress(sameWindow: Bool) {
+        defer { playbackCursor?.refreshAfterMouseRelease() }
         // Native mouseUp can arrive before the watchdog or focus notification.
         // Every release path must validate the same live context and surface.
         guard let win = playerView.window, win.isKeyWindow, win.attachedSheet == nil,
