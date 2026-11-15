@@ -56,7 +56,8 @@ methods = methods.replace('NSEvent.mouseLocation', 'SPHoldFixtureInput.pointer')
 methods = methods.replace('NSEvent.pressedMouseButtons', 'SPHoldFixtureInput.buttons')
 methods = methods.replace('SPTurboSettings.isEnabled', 'SPHoldFixtureInput.enabled')
 methods = methods.replace('SPTurboSettings.rate', 'SPHoldFixtureInput.configuredRate')
-cursor = (root / 'Apps/Mac/UI/SPPlaybackCursorController.swift').read_text()
+cursor = pathlib.Path(os.environ.get('VIDEO_HOLD_CURSOR_SOURCE',
+    str(root / 'Apps/Mac/UI/SPPlaybackCursorController.swift'))).read_text()
 # Preserve the complete production cursor controller, including gates,
 # notifications and ownership. Substitute only OS state sampled by its gates.
 for old, new in [

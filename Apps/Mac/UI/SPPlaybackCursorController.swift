@@ -12,6 +12,7 @@ final class SPPlaybackCursorController {
     private var trackingMenus: Set<ObjectIdentifier> = []
     private var observers: [NSObjectProtocol] = []
     private var ownsHiddenCursor = false
+    private var pendingReleasePoint: NSPoint?
     private let setCursorHidden: (Bool) -> Void
     private static let dbg = ProcessInfo.processInfo.environment["SP_DEBUG"] != nil
 
@@ -94,10 +95,20 @@ final class SPPlaybackCursorController {
         apply()
     }
 
-    /// A held button can defer hiding after chrome disappears. Recheck its
-    /// existing visibility request on release without revealing controls.
+    /// Native motion can reveal the cursor without clearing our ownership.
+    /// Reassert the existing request, then check once after AppKit finishes
+    /// delivering mouse-up. Do not hide again if the pointer moved meanwhile.
     func refreshAfterMouseRelease() {
-        apply()
+        apply(reassertHide: true)
+        let alreadyPending = pendingReleasePoint != nil
+        pendingReleasePoint = NSEvent.mouseLocation
+        guard !alreadyPending else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let releasePoint = self.pendingReleasePoint else { return }
+            self.pendingReleasePoint = nil
+            guard NSEvent.mouseLocation == releasePoint else { return }
+            self.apply(reassertHide: true)
+        }
     }
 
     private func observe(_ name: Notification.Name, object: AnyObject?,
@@ -130,16 +141,16 @@ final class SPPlaybackCursorController {
         return view.visibleRect.contains(view.convert(window.convertPoint(fromScreen: point), from: nil))
     }
 
-    private func apply() {
+    private func apply(reassertHide: Bool = false) {
         if chromeHidden, eligible, NSEvent.pressedMouseButtons == 0, pointerInside {
-            hide()
+            hide(reassert: reassertHide)
         } else {
             reveal()
         }
     }
 
-    private func hide() {
-        guard !ownsHiddenCursor else { return }
+    private func hide(reassert: Bool) {
+        guard reassert || !ownsHiddenCursor else { return }
         ownsHiddenCursor = true
         setCursorHidden(true)
         if Self.dbg { NSLog("[Cursor] 隐藏（随控制区）") }

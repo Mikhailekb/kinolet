@@ -90,6 +90,9 @@ private enum SPHoldControl { case toggle }
     var videoHoldTimer: Timer?
     var playbackCursor: SPPlaybackCursorController?
     var cursorEffects: [Bool] = []
+    // Native visibility can change without the application calling its setter:
+    // setHiddenUntilMouseMoves automatically reveals on pointer motion.
+    var nativeCursorHidden = false
     var hasMediaSession = true
     var hasVideoSession = true
     var isSettingsPanelShown = false
@@ -117,12 +120,14 @@ private enum SPHoldControl { case toggle }
     }
     func shutdown() {
         endTurbo(reason: "fixtureTeardown")
+        playbackCursor = nil // Retire queued weak callbacks before the next fixture.
         if let clickUpMonitor { NSEvent.removeMonitor(clickUpMonitor); self.clickUpMonitor = nil }
     }
     func installCursor() {
         SPHoldFixtureInput.topWindowNumber = playerView.window!.windowNumber
         playbackCursor = SPPlaybackCursorController(view: playerView, setCursorHidden: { [weak self] in
             self?.cursorEffects.append($0)
+            self?.nativeCursorHidden = $0
         })
         playbackCursor?.setHasVideo(true)
     }
@@ -424,12 +429,12 @@ private enum SPHoldControl { case toggle }
             let pointer = SPHoldFixtureInput.pointer
             if delivery == "watchdog" { SPHoldFixtureInput.buttons = 0; owner.poll() }
             else { mouse(owner, window, down: false) }
-            check(owner.cursorEffects == [true] && SPHoldFixtureInput.pointer == pointer &&
+            check(owner.nativeCursorHidden && SPHoldFixtureInput.pointer == pointer &&
                   owner.chrome?.isHidden == true,
                   "stationary \(delivery) release hides cursor after hidden-chrome mouse Turbo")
             mouse(owner, window, down: false)
-            check(owner.cursorEffects == [true] && owner.core?.rates == [2, 1.25] && owner.core?.toggles == 0,
-                  "duplicate release hides once and restores speed without a pause")
+            check(owner.nativeCursorHidden && owner.core?.rates == [2, 1.25] && owner.core?.toggles == 0,
+                  "duplicate release keeps cursor hidden and restores speed once without a pause")
         }
         do {
             let (owner, window) = fixture(); defer { owner.shutdown() }
@@ -439,10 +444,10 @@ private enum SPHoldControl { case toggle }
             space(owner, down: true)
             owner.playbackCursor?.setChromeHidden(true)
             mouse(owner, window, down: false)
-            check(owner.cursorEffects == [true] && owner.turbo.owners == [.space] && owner.core?.playbackRate == 2,
+            check(owner.nativeCursorHidden && owner.turbo.owners == [.space] && owner.core?.playbackRate == 2,
                   "stationary mouse release hides cursor while independent Space Turbo remains active")
             space(owner, down: false)
-            check(owner.cursorEffects == [true] && owner.core?.rates == [2, 1.25] && owner.core?.toggles == 0,
+            check(owner.nativeCursorHidden && owner.core?.rates == [2, 1.25] && owner.core?.toggles == 0,
                   "remaining Space release preserves hidden pointer and restores once")
         }
         do {
@@ -456,7 +461,7 @@ private enum SPHoldControl { case toggle }
             check(owner.cursorEffects.isEmpty,
                   "release preserves a shown-chrome or PiP cursor intent instead of deriving it from main chrome")
             owner.playbackCursor?.setChromeHidden(true)
-            check(owner.cursorEffects == [true], "cursor remains eligible once an actual hide request follows release")
+            check(owner.nativeCursorHidden, "cursor remains eligible once an actual hide request follows release")
         }
         for gate in ["inactive", "modal", "key", "visible", "occluded", "sheet", "outside", "covered", "audio", "fullscreen", "menu", "otherButton"] {
             let (owner, window) = fixture(); defer { owner.shutdown() }
@@ -497,7 +502,164 @@ private enum SPHoldControl { case toggle }
             if gate == "fullscreen" { NotificationCenter.default.post(name: NSWindow.didEnterFullScreenNotification, object: window) }
             if gate == "menu" { NotificationCenter.default.post(name: NSMenu.didEndTrackingNotification, object: menu) }
             owner.playbackCursor?.refreshAfterMouseRelease()
-            check(owner.cursorEffects == [true], "removing \(gate) permits the unchanged cursor hide request")
+            check(owner.nativeCursorHidden, "removing \(gate) permits the unchanged cursor hide request")
+        }
+        // These cases model the native cursor separately from setter history.
+        // The platform may reveal it after a drag or later in mouseUp dispatch
+        // while the application still owns its previous hide request.
+        let selectedCursorCase = ProcessInfo.processInfo.environment["VIDEO_HOLD_CURSOR_CASE"]
+        func cursorCase(_ name: String) -> Bool { selectedCursorCase == nil || selectedCursorCase == name }
+        if cursorCase("stale-ownership") {
+            let (owner, window) = fixture(); defer { owner.shutdown() }
+            owner.installCursor()
+            SPHoldFixtureInput.buttons = 0
+            owner.chrome?.isHidden = true
+            owner.playbackCursor?.setChromeHidden(true)
+            check(owner.nativeCursorHidden, "cursor is already natively hidden before the next video press")
+            SPHoldFixtureInput.buttons = 1
+            mouse(owner, window, down: true)
+            waitUntil { owner.turbo.phase == .active }
+            SPHoldFixtureInput.pointer.x += 12
+            owner.nativeCursorHidden = false // Native auto-reveal; no policy call.
+            owner.drag()
+            check(!owner.nativeCursorHidden && owner.core?.playbackRate == 2,
+                  "native motion can reveal an owned hidden cursor during active Turbo")
+            mouse(owner, window, down: false)
+            check(owner.nativeCursorHidden && owner.core?.rates == [2, 1.25] && owner.core?.toggles == 0,
+                  "release reasserts native hiding when logical hide ownership is stale")
+        }
+        if cursorCase("post-event") {
+            let (owner, window) = fixture(); defer { owner.shutdown() }
+            owner.installCursor()
+            mouse(owner, window, down: true)
+            waitUntil { owner.turbo.phase == .active }
+            owner.chrome?.isHidden = true
+            owner.playbackCursor?.setChromeHidden(true)
+            mouse(owner, window, down: false)
+            check(owner.nativeCursorHidden, "eligible release can hide synchronously before AppKit finishes dispatch")
+            owner.nativeCursorHidden = false // Later native work in the same event.
+            let beforeQueue = owner.cursorEffects.count
+            wait(0.03)
+            check(owner.nativeCursorHidden && owner.cursorEffects.count == beforeQueue + 1,
+                  "post-dispatch reconciliation repairs a native reveal after synchronous release")
+            check(owner.chrome?.isHidden == true && owner.core?.rates == [2, 1.25] && owner.core?.toggles == 0,
+                  "post-dispatch cursor repair does not reveal controls or replay playback effects")
+        }
+        if cursorCase("button-mask") {
+            let (owner, window) = fixture(); defer { owner.shutdown() }
+            owner.installCursor()
+            mouse(owner, window, down: true)
+            waitUntil { owner.turbo.phase == .active }
+            owner.playbackCursor?.setChromeHidden(true)
+            let event = NSEvent.mouseEvent(with: .leftMouseUp, location: CGPoint(x: 100, y: 100),
+                modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                windowNumber: window.windowNumber, context: nil, eventNumber: 1, clickCount: 1, pressure: 0)!
+            // Do not use mouse(), which would clear the sampled button mask.
+            owner.playerView.mouseUp(with: event)
+            check(!owner.nativeCursorHidden && owner.cursorEffects.isEmpty,
+                  "a button mask still reporting LMB prevents synchronous release hiding")
+            SPHoldFixtureInput.buttons = 0 // OS catches up without a motion event.
+            wait(0.03)
+            check(owner.nativeCursorHidden && owner.core?.rates == [2, 1.25] && owner.core?.toggles == 0,
+                  "post-dispatch reconciliation observes the released button without another event")
+        }
+        if cursorCase("coalescing") {
+            let (owner, _) = fixture(); defer { owner.shutdown() }
+            owner.installCursor()
+            SPHoldFixtureInput.buttons = 0
+            owner.playbackCursor?.setChromeHidden(true)
+            for _ in 0..<3 { owner.playbackCursor?.refreshAfterMouseRelease() }
+            let beforeQueue = owner.cursorEffects.count
+            owner.nativeCursorHidden = false
+            wait(0.03)
+            check(owner.nativeCursorHidden && Array(owner.cursorEffects.dropFirst(beforeQueue)) == [true],
+                  "repeated release refreshes coalesce into exactly one deferred native hide")
+            let afterQueue = owner.cursorEffects.count
+            wait(0.03)
+            check(owner.cursorEffects.count == afterQueue, "release reconciliation does not become a timer or polling loop")
+        }
+        if cursorCase("latest-point") {
+            let (owner, _) = fixture(); defer { owner.shutdown() }
+            owner.installCursor()
+            SPHoldFixtureInput.buttons = 0
+            owner.playbackCursor?.setChromeHidden(true)
+            owner.playbackCursor?.refreshAfterMouseRelease()
+            SPHoldFixtureInput.pointer.x += 2
+            owner.playbackCursor?.refreshAfterMouseRelease()
+            owner.nativeCursorHidden = false
+            let beforeQueue = owner.cursorEffects.count
+            wait(0.03)
+            check(owner.nativeCursorHidden && owner.cursorEffects.count == beforeQueue + 1,
+                  "a coalesced refresh tracks the latest release position rather than the first one")
+        }
+        if cursorCase("pointer-moved") {
+            let (owner, _) = fixture(); defer { owner.shutdown() }
+            owner.installCursor()
+            SPHoldFixtureInput.buttons = 0
+            owner.playbackCursor?.setChromeHidden(true)
+            owner.playbackCursor?.refreshAfterMouseRelease()
+            owner.nativeCursorHidden = false
+            SPHoldFixtureInput.pointer.x += 2
+            let beforeQueue = owner.cursorEffects.count
+            wait(0.03)
+            check(!owner.nativeCursorHidden && owner.cursorEffects.count == beforeQueue,
+                  "pointer motion after release cancels its deferred hide")
+            owner.playbackCursor?.refreshAfterMouseRelease()
+            owner.nativeCursorHidden = false
+            wait(0.03)
+            check(owner.nativeCursorHidden,
+                  "a skipped moving-pointer reconciliation permits the next stationary request")
+        }
+        if cursorCase("deferred-gates") {
+            for gate in ["shown", "pip", "mouseHeld", "sheet", "menu", "key", "outside", "covered",
+                         "inactive", "visible", "occluded", "audio", "fullscreen", "modal"] {
+                let (owner, window) = fixture(); defer { owner.shutdown() }
+                owner.installCursor()
+                SPHoldFixtureInput.buttons = 0
+                owner.playbackCursor?.setChromeHidden(true)
+                owner.playbackCursor?.refreshAfterMouseRelease()
+                owner.nativeCursorHidden = false
+                let menu = NSMenu()
+                switch gate {
+                case "shown", "pip": owner.playbackCursor?.setChromeHidden(false)
+                case "mouseHeld": SPHoldFixtureInput.buttons = 1
+                case "sheet": window.fixtureSheet = NSWindow(contentRect: .zero, styleMask: [.borderless], backing: .buffered, defer: false)
+                case "menu": NotificationCenter.default.post(name: NSMenu.didBeginTrackingNotification, object: menu)
+                case "key": window.fixtureKey = false
+                case "outside": SPHoldFixtureInput.pointer = CGPoint(x: -10_000, y: -10_000)
+                case "covered": SPHoldFixtureInput.topWindowNumber = -1
+                case "inactive": SPHoldFixtureInput.appActive = false
+                case "visible": window.fixtureVisible = false
+                case "occluded": window.fixtureOcclusion = []
+                case "audio": owner.playbackCursor?.setHasVideo(false)
+                case "fullscreen": NotificationCenter.default.post(name: NSWindow.willEnterFullScreenNotification, object: window)
+                default: SPHoldFixtureInput.modalWindow = NSWindow(contentRect: .zero, styleMask: [.borderless], backing: .buffered, defer: false)
+                }
+                let beforeQueue = owner.cursorEffects.count
+                wait(0.03)
+                check(!owner.nativeCursorHidden && !owner.cursorEffects.dropFirst(beforeQueue).contains(true),
+                      "deferred reconciliation rechecks the current \(gate) safety gate")
+                if gate != "outside" {
+                    check(owner.cursorEffects.last == false,
+                          "blocked deferred hide retains ownership long enough to undo the earlier native request")
+                }
+            }
+        }
+        if cursorCase("lifetime") {
+            let (owner, _) = fixture(); defer { owner.shutdown() }
+            owner.installCursor()
+            SPHoldFixtureInput.buttons = 0
+            owner.playbackCursor?.setChromeHidden(true)
+            owner.playbackCursor?.refreshAfterMouseRelease()
+            weak var cursor = owner.playbackCursor
+            owner.playbackCursor = nil
+            check(cursor == nil && !owner.nativeCursorHidden,
+                  "queued reconciliation does not retain a retired cursor owner or its native hide")
+            let beforeQueue = owner.cursorEffects.count
+            wait(0.03)
+            check(owner.cursorEffects.count == beforeQueue,
+                  "a retired cursor's queued callback cannot hide the pointer again")
+            cursor = nil
         }
         for mouseFirst in [true, false] {
             let (owner, window) = fixture(); defer { owner.shutdown() }
